@@ -340,6 +340,10 @@ def existing_graph_node_counts_by_source(path: "str | Path"):
 
 
 def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None, original_links: "list[dict] | None" = None) -> bool:
+    from graphify.framework_evidence import EvidenceValidationError, extract_evidence
+    from graphify.framework_pipeline import evidence_from_data
+    # Validate before any mutation, including when force bypasses node-count guards.
+    evidence = extract_evidence(G)
     # Drop #3774 accounting before any write. Extract pops these first; every
     # other caller of to_json (the documented build_merge persist path) does not.
     from graphify.build import take_dedup_remap, take_shrink_accounting
@@ -349,10 +353,14 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     take_shrink_accounting(G)
     # Sources build_merge replaced or pruned this run: their old semantic ids
     # are not lost. Popped so it is never written into graph.json.
-    replaced_sources = set(G.graph.pop("_replaced_sources", None) or ())
+    replaced_sources: set[str] = set(G.graph.pop("_replaced_sources", None) or ())
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
-    if not force and existing_path.exists():
+    existing_data = None
+    existing_error = None
+    previous_hyperedges = None
+    oversized = False
+    if existing_path.exists():
         from graphify.security import check_graph_file_size_cap
         try:
             check_graph_file_size_cap(existing_path)
@@ -361,43 +369,40 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
             # be the very DoS the cap guards against. Can't verify — let the new
             # graph replace the oversized file.
             oversized = True
-        else:
-            oversized = False
         if not oversized:
             try:
                 raw = existing_path.read_text(encoding="utf-8")
-            except Exception:
-                raw = ""
-            if not raw.strip():
-                # Empty/whitespace existing file (e.g. a freshly touched path):
-                # no nodes to lose, so any new graph is a growth — proceed.
-                existing_n = 0
-                existing_nodes = []
-            else:
-                try:
-                    existing_data = json.loads(raw)
-                    del raw
-                    existing_nodes = existing_data.get("nodes", [])
-                    # Only the node list is compared; let the links go now.
-                    del existing_data
-                    if not isinstance(existing_nodes, list):
-                        existing_nodes = []
-                    existing_n = len(existing_nodes)
-                except Exception as exc:
-                    # Non-empty but unparseable existing graph (corrupt or a
-                    # mid-write): we cannot verify the new graph is not a silent
-                    # shrink. Fail SAFE — refuse rather than overwrite. A
-                    # fail-OPEN here (the prior behavior) is the silent data-loss
-                    # path #479 exists to prevent: a transiently unreadable
-                    # graph.json would let a partial rebuild clobber a good one.
-                    import sys as _sys
-                    print(
-                        f"[graphify] WARNING: existing {existing_path} could not be "
-                        f"read to verify the new graph is not smaller ({exc}). "
-                        f"Refusing to overwrite; pass force=True to override.",
-                        file=_sys.stderr,
+                existing_data = json.loads(raw) if raw.strip() else {}
+                del raw
+                if not isinstance(existing_data, dict):
+                    raise ValueError("graph must be a JSON object")
+            except Exception as exc:
+                existing_error = exc
+                existing_data = None
+            if existing_data is not None:
+                previous_evidence = evidence_from_data(existing_data)
+                if previous_evidence is not None and evidence is None:
+                    raise EvidenceValidationError(
+                        "Refusing to discard saved semantic evidence: merge explicit source "
+                        "replacements/deletions or attach an intentionally empty validated store"
                     )
-                    return False
+                del previous_evidence
+                previous_hyperedges = existing_data.get("hyperedges")
+    if not force and existing_path.exists():
+        if not oversized:
+            if existing_error is not None:
+                # A non-empty unreadable graph cannot justify an unverified shrink.
+                print(
+                    f"[graphify] WARNING: existing {existing_path} could not be "
+                    f"read to verify the new graph is not smaller ({existing_error}). "
+                    f"Refusing to overwrite; pass force=True to override.",
+                    file=sys.stderr,
+                )
+                return False
+            existing_nodes = existing_data.get("nodes", []) if existing_data is not None else []
+            if not isinstance(existing_nodes, list):
+                existing_nodes = []
+            existing_n = len(existing_nodes)
             new_n = G.number_of_nodes()
             from graphify.build import _dedup_shrink_allowance, _lost_saved_semantic_nodes
             new_node_list = [
@@ -442,6 +447,7 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 return False
             # The guard passed; free its copies of both graphs before export.
             del existing_nodes, new_node_list, existing_ids
+    del existing_data
 
     node_community = _node_community_map(communities)
     _labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
@@ -449,6 +455,9 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         data = json_graph.node_link_data(G, edges="links")
     except TypeError:
         data = json_graph.node_link_data(G)
+    # NetworkX shares graph attributes with G. Export stamps must not mutate the
+    # caller's metadata or substitute an unvalidated alias for the captured store.
+    data["graph"] = dict(data.get("graph", {}))
 
     def _json_sort_key(item: dict) -> str:
         return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -535,18 +544,7 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         # the graph's truth rather than preserving the stale set — resurrecting
         # hyperedges whose members may no longer exist would reintroduce the
         # dangling-member shape #1916 removed.
-        _prev_hyperedges = None
-        try:
-            if existing_path.exists():
-                from graphify.security import check_graph_file_size_cap
-                check_graph_file_size_cap(existing_path)
-                _prev = json.loads(existing_path.read_text(encoding="utf-8"))
-                if isinstance(_prev, dict):
-                    _prev_hyperedges = _prev.get("hyperedges")
-                # Only the hyperedges are read; do not hold the whole parse.
-                del _prev
-        except Exception:
-            _prev_hyperedges = None
+        _prev_hyperedges = previous_hyperedges
         if _prev_hyperedges:
             print(
                 f"[graphify] WARNING: graph carries no hyperedge metadata but "
@@ -555,6 +553,8 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 f"extraction if this is unexpected.",
                 file=sys.stderr,
             )
+    if evidence is not None:
+        data.setdefault("graph", {})["semantic_evidence"] = evidence
     hyperedges = sorted(getattr(G, "graph", {}).get("hyperedges", []), key=_json_sort_key)
     if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
         data["graph"]["hyperedges"] = hyperedges

@@ -21,6 +21,7 @@
 #    before any graph construction happens.
 #
 from __future__ import annotations
+import copy
 import json
 import math
 import os
@@ -1672,6 +1673,8 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         remain enabled.
     """
     _root = str(Path(root).resolve()) if root else None
+    from graphify.framework_pipeline import evidence_from_data
+    framework_evidence = evidence_from_data(extraction)
     # NetworkX <= 3.1 serialised edges as "links"; remap to "edges" for compatibility.
     if "edges" not in extraction and "links" in extraction:
         extraction = dict(extraction, edges=extraction["links"])
@@ -2437,6 +2440,8 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # Also last, after the method-ghost passes above: C# methods display with
     # their owning type (#4883).
     _qualify_csharp_method_labels(G)
+    if framework_evidence is not None:
+        G.graph["semantic_evidence"] = framework_evidence
     return G
 
 
@@ -2467,6 +2472,8 @@ def build(
     collisions remain isolated and are reported.
     """
     from graphify.dedup import deduplicate_entities
+    from graphify.framework_pipeline import combine_evidence
+    extractions = list(extractions)
     combined: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
     for ext in extractions:
         combined["nodes"].extend(ext.get("nodes", []))
@@ -2474,6 +2481,9 @@ def build(
         combined["hyperedges"].extend(ext.get("hyperedges", []))
         combined["input_tokens"] += ext.get("input_tokens", 0)
         combined["output_tokens"] += ext.get("output_tokens", 0)
+    evidence = combine_evidence(extractions, root=root)
+    if evidence is not None:
+        combined["semantic_evidence"] = evidence
     _root = str(Path(root).resolve()) if root else None
     _dedup_collapsed = 0
     _dedup_remap: dict[str, str] = {}
@@ -2612,7 +2622,7 @@ def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dic
     return deduped_nodes, deduped_edges
 
 
-def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | None":
+def _load_existing_graph(graph_path: Path, *, metadata_out: dict | None = None) -> "tuple[list, list, list, bool] | None":
     """Load (nodes, edges, hyperedges, directed) from an existing graph.json for
     an incremental merge, accepting both the ``links`` and ``edges`` spellings
     and either hyperedge persistence slot (top-level or ``graph.hyperedges``).
@@ -2629,6 +2639,8 @@ def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | N
     exists but cannot be parsed — callers must refuse to overwrite rather
     than silently replace a possibly-recoverable graph.
     """
+    if metadata_out is not None:
+        metadata_out.pop("data", None)
     if not graph_path.exists():
         return None
     from graphify.security import check_graph_file_size_cap
@@ -2640,6 +2652,10 @@ def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | N
             f"Cannot read {graph_path} for incremental merge: {exc}. "
             "Delete the file and run a full rebuild."
         ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Cannot read {graph_path}: graph must be a JSON object")
+    from graphify.framework_pipeline import evidence_from_data
+    evidence_from_data(data)
     links_key = "links" if "links" in data else "edges"
     nodes = list(data.get("nodes", []))
     edges = list(data.get(links_key, []))
@@ -2663,6 +2679,12 @@ def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | N
         graph_attrs = data.get("graph")
         nested = graph_attrs.get("hyperedges") if isinstance(graph_attrs, dict) else None
         hyperedges = nested if isinstance(nested, list) else []
+    if metadata_out is not None:
+        # Reconciliation must compare against the unmodified same-read snapshot,
+        # not a baseline changed by provenance backfills or nested normalization.
+        nodes = copy.deepcopy(nodes)
+        edges = copy.deepcopy(edges)
+        hyperedges = copy.deepcopy(hyperedges)
     # Backfill tier provenance on legacy items (#2334): _origin is stamped at
     # extraction time only (extract.py for AST, and the semantic path never
     # stamps), so pre-0.9.16 graphs and externally-merged fragments carry
@@ -2672,6 +2694,8 @@ def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | N
     for item in nodes + edges:
         if isinstance(item, dict):
             _backfill_origin(item)
+    if metadata_out is not None:
+        metadata_out["data"] = data
     return (
         nodes,
         edges,
@@ -2694,6 +2718,7 @@ def _tier_replacement_sources(
     nodes/edges. Falls back to AST node source_file only when no provenance is
     provided.
     """
+    _root = str(root) if root is not None else None
     explicit_ast_sources: set[str] = set()
     if ast_sources is not None:
         for s in ast_sources:
@@ -2711,7 +2736,7 @@ def _tier_replacement_sources(
     if explicit_ast_sources:
         for sf in explicit_ast_sources:
             new_ast_sources.add(sf)
-            norm = _norm_source_file(sf, root)
+            norm = _norm_source_file(sf, _root)
             if norm:
                 new_ast_sources.add(norm)
     else:
@@ -2725,7 +2750,7 @@ def _tier_replacement_sources(
                 if not sf or not _is_ast_tier(n):
                     continue
                 new_ast_sources.add(sf)
-                norm = _norm_source_file(sf, root)
+                norm = _norm_source_file(sf, _root)
                 if norm:
                     new_ast_sources.add(norm)
 
@@ -2739,7 +2764,7 @@ def _tier_replacement_sources(
             if not sf or _is_ast_tier(n):
                 continue
             new_sem_sources.add(sf)
-            norm = _norm_source_file(sf, root)
+            norm = _norm_source_file(sf, _root)
             if norm:
                 new_sem_sources.add(norm)
 
@@ -2795,11 +2820,21 @@ def merge_raw_extraction(
     existing graph is present but unparseable — the caller must refuse to
     overwrite it. No-op when ``graph_path`` does not exist.
     """
+    from graphify.framework_pipeline import combine_evidence, evidence_from_data
+    incoming_evidence = evidence_from_data(new)
     graph_path = Path(graph_path)
-    loaded = _load_existing_graph(graph_path)
+    metadata: dict = {}
+    loaded = _load_existing_graph(graph_path, metadata_out=metadata)
     if loaded is None:
+        if incoming_evidence is not None:
+            new["semantic_evidence"] = combine_evidence(
+                [new], root=root,
+            )
+            if isinstance(new.get("graph"), dict):
+                new["graph"] = {k: v for k, v in new["graph"].items() if k != "semantic_evidence"}
         return new
     existing_nodes, existing_edges, existing_hyperedges, _ = loaded
+    previous_evidence = evidence_from_data(metadata["data"])
 
     _eff_root = (
         str(Path(root).resolve()) if root is not None
@@ -2836,12 +2871,14 @@ def merge_raw_extraction(
     # prune paths against the stored relative source_files and retry — same
     # fallback as build_merge.
     if prune_set or prune_abs:
-        _stored_sfs = {
-            item.get("source_file")
+        _stored_sfs: set[str] = {
+            source
             for seq in (existing_nodes, existing_edges, existing_hyperedges)
             for item in seq if isinstance(item, dict)
+            if isinstance(source := item.get("source_file"), str)
         }
-        _stored_sfs.discard(None)
+        if previous_evidence is not None:
+            _stored_sfs.update(previous_evidence["documents"])
         if not any(_prune_hit(sf) for sf in _stored_sfs):
             _derived = _derive_prune_root(prune_sources or [], _stored_sfs)
             if _derived is not None and _derived != _prune_root:
@@ -2889,6 +2926,13 @@ def merge_raw_extraction(
             if prior_count > 1 and fresh_count < prior_count:
                 unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
 
+    # Validate/merge before mutating the caller's raw lists. Reusing the loader's
+    # same-read metadata prevents mixed-generation structural/evidence baselines.
+    evidence = combine_evidence(
+        [new], previous=previous_evidence, root=_prune_root,
+        replaced_sources=new_ast_sources if previous_evidence is not None else (),
+        deleted_sources=prune_sources or (),
+    )
     new["nodes"] = [n for n in existing_nodes if not _dropped(n)] + list(new.get("nodes", []))
     new["edges"] = [e for e in existing_edges if not _dropped(e)] + list(new.get("edges", []))
     carried_hyper = [he for he in existing_hyperedges if not _dropped(he)]
@@ -2896,6 +2940,10 @@ def merge_raw_extraction(
         new["hyperedges"] = carried_hyper + list(new.get("hyperedges", []))
     if unverified_semantic_shrink:
         new["_unverified_semantic_shrink"] = unverified_semantic_shrink
+    if evidence is not None:
+        if isinstance(new.get("graph"), dict):
+            new["graph"] = {k: v for k, v in new["graph"].items() if k != "semantic_evidence"}
+        new["semantic_evidence"] = evidence
     return new
 
 
@@ -2937,7 +2985,8 @@ def build_merge(
     # build itself), so a one-shot iterator must be materialised first.
     new_chunks = list(new_chunks)
     graph_path = Path(graph_path if graph_path is not None else _default_graph_json())
-    _loaded = _load_existing_graph(graph_path)
+    metadata: dict = {}
+    _loaded = _load_existing_graph(graph_path, metadata_out=metadata)
     if _loaded is not None:
         existing_nodes, existing_edges, existing_hyperedges, existing_directed = _loaded
         had_graph = True
@@ -2947,6 +2996,8 @@ def build_merge(
         existing_hyperedges = []
         existing_directed = False
         had_graph = False
+    from graphify.framework_pipeline import combine_evidence, evidence_from_data
+    previous_evidence = evidence_from_data(metadata["data"]) if had_graph else None
     if directed is None:
         directed = existing_directed if had_graph else False
 
@@ -3100,12 +3151,14 @@ def build_merge(
     # warning below. Runs before the hyperedge carry so hyperedge pruning
     # benefits too.
     if prune_set or prune_abs:
-        _stored_sfs = {
-            item.get("source_file")
+        _stored_sfs: set[str] = {
+            source
             for seq in (_disk_nodes, existing_edges, existing_hyperedges)
             for item in seq if isinstance(item, dict)
+            if isinstance(source := item.get("source_file"), str)
         }
-        _stored_sfs.discard(None)
+        if previous_evidence is not None:
+            _stored_sfs.update(previous_evidence["documents"])
         if not any(_prune_match(sf) for sf in _stored_sfs):
             _derived = _derive_prune_root(prune_sources or [], _stored_sfs)
             if _derived is not None and _derived != _prune_root:
@@ -3190,6 +3243,15 @@ def build_merge(
         root=_eff_root,
         protected_ids=_protected_ids,
     )
+    evidence = combine_evidence(
+        new_chunks,
+        previous=previous_evidence,
+        root=_prune_root,
+        replaced_sources=new_ast_sources if previous_evidence is not None else (),
+        deleted_sources=prune_sources or (),
+    )
+    if evidence is not None:
+        G.graph["semantic_evidence"] = evidence
 
     # Runs after every merge, not only under prune_sources: re-extraction strands
     # placeholders too, e.g. per-file stubs re-pointed at a shared node (#4247)
@@ -3465,6 +3527,12 @@ def prefix_graph_for_global(
     collide and the aggregated community view fuses unrelated communities
     into one meta-node (#3014). 0 (the default) leaves communities untouched.
     """
+    from graphify.framework_evidence import EvidenceValidationError, extract_evidence
+    if extract_evidence(G) is not None:
+        raise EvidenceValidationError(
+            "Cross-repository semantic evidence requires a corpus-qualified contract; "
+            "version 1 cannot be globally prefixed or composed losslessly"
+        )
     # External stubs (stdlib / third-party modules, #2873) are GLOBAL
     # identifiers, not repo-local: leaving their id unprefixed lets the same
     # module unify into one node across repos instead of fragmenting into

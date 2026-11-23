@@ -156,6 +156,122 @@ Reach for the graph when you need to understand a codebase, not just read throug
 
 ---
 
+## TypeScript framework evidence (v8-zen)
+
+This branch adds a deterministic, Graphify-owned TypeScript/TSX analysis lane.
+It uses Graphify's Tree-sitter parser and a bundled Node.js analyzer. It does not
+import or run Zen, the indexed application, or the indexed framework libraries.
+There are no runtime npm dependencies or model calls in this lane. Node.js 20 or
+newer must be available on `PATH`; extraction never installs it automatically.
+
+The parity target is the reviewed **source-only** library contracts, not a full
+TypeScript compiler `Program`, runtime tracing, or Zen's Concept registry and
+operation-retrieval subsystem. Existing generic Graphify relationships continue
+to provide navigation. Typed facts are retained separately rather than collapsed
+into one edge per pair of nodes.
+
+Library callers should supply a stable `root` (or the explicit `framework_root`
+when structural and evidence coordinates differ) for incremental work. A cache
+folder outside the inputs is not treated as their source root; without an
+explicit root, typed evidence uses the supplied inputs' common parent.
+
+| Producer | Retained evidence |
+| --- | --- |
+| `fst-solid` | Components/factories, State/Form/Scope/ItemScope lifetimes, Field read/write and borrowing, lifecycle/context, callbacks, loaders, lists, routing and reviewed handle APIs |
+| `solid` | Signal/store pairs, reactive/owner boundaries, tracked and untracked reads, conditional JSX callback contracts, prop contributions/overrides, resources, transitions, rendering and reviewed router APIs |
+| `fst-components` | Reviewed controls, editors, overlays, icons and scene/Three.js callback, field and ownership contracts |
+| `implementation` | Local returns/throws/writes/guards, qualified environment/defaulting, declared tests and assertion syntax |
+| `transport-binding` | Qualified local EventEmitter allocation/listener/emission units, without inventing execution or matching unrelated instances |
+| `validation-contract` | Reviewed inline Zod primitive-object validation uses and conditional predicates, not arbitrary schema interpretation |
+| `dispatch-binding` | Restricted Elysia/tRPC in-process registration/request/caller units, not deployed network-route proof |
+
+Import identity, lexical scope, mutation/escape vetoes, callback ownership,
+UTF-8 evidence ranges, producer manifests and explicit coverage remain part of
+the result. Unknown or unsupported shapes are not upgraded to complete facts.
+In particular, a field called with `undefined` is not automatically a write,
+borrowed fields do not acquire disposal ownership, and registration is not
+callback execution.
+
+### Build, index and retrieve
+
+The distributable includes `graphify/semantic_node/worker.mjs`. When changing its
+owned source, rebuild and qualify it from the repository root:
+
+```sh
+npm ci --prefix graphify/semantic_node
+npm run build --prefix graphify/semantic_node
+npm run typecheck --prefix graphify/semantic_node
+npm test --prefix graphify/semantic_node
+```
+
+Indexing automatically includes the lane for admitted `.ts`, `.tsx`, `.mts` and
+`.cts` sources. `--code-only` skips document/model extraction, not deterministic
+framework analysis:
+
+```sh
+graphify extract ./project --code-only --no-cluster
+graphify semantic-search --symbol MyState --graph ./project/graphify-out/graph.json
+graphify semantic-inspect "<exact returned reference>" --graph ./project/graphify-out/graph.json --max-bytes 32768
+```
+
+The MCP equivalents are **`query_semantics`** and **`inspect_semantics`**. Search
+supports source path/prefix, exact plugin and declaration selection. Inspection
+returns grouped roles, properties and relations, their vocabulary meanings,
+qualified references, captured source excerpts, diagnostics and coverage. Use
+the returned exact reference and continuation; do not construct identities from
+labels. These reads do not open live source or invoke analysis or a model.
+
+`max_bytes` bounds the complete encoded semantic response, including metadata.
+Facts are not cut into misleading prefixes. Follow continuation with the same
+selection and limits; an indivisible record that cannot fit produces an explicit
+unsupported result and required byte count. Ordinary `query` and `path` remain
+navigation operations, not substitutes for typed framework evidence.
+
+### Explicit library identities
+
+The adapters recognize reviewed public module contracts, not arbitrary classes
+named `State`, `Form` or `Field`. If a project publishes a compatible library
+under another bare module prefix, declare that assumption in its `.graphifyrc`:
+
+```ini
+semantic_module_aliases = {"@my/state":"@fst/components-fst-solid","@my/controls":"@fst/components-fst-disco-ui"}
+```
+
+There are no application-specific default aliases. Mapping changes semantic
+identity and is recorded with the producer configuration. It does not rewrite
+source bytes, execute packages, or prove installed-library/runtime equivalence.
+Unknown mappings and unsafe shapes must not acquire guessed framework behavior.
+
+### Evidence and qualification boundaries
+
+Canonical graph JSON stores the versioned lane under `graph.semantic_evidence`.
+It preserves declarations, every role/property/relation occurrence, complete
+wire records, manifests and exact source snapshots. It does not pass these
+records through graph-edge deduplication or display metadata truncation. This
+also means graph artifacts contain source text and must be treated as sensitive
+project data. Credential-shaped content is rejected, not rewritten while still
+claiming its original source hash.
+
+Source changes, explicit deletions, producer/parser changes and applicable
+configuration changes invalidate affected evidence. Failed/partial replacement
+does not silently turn a retained good snapshot into current complete evidence.
+Exact references become stale rather than following similarly named symbols.
+The lane retains current and last-complete evidence, not an append-only history.
+
+Current protocol bounds include 256 KiB source per document, 16 documents and
+1 MiB source per request, 100,000 syntax nodes per document, 250,000 per request,
+16 MiB request/32 MiB response, and per-document declaration/fact/work budgets.
+Limits and truncation are explicit. Unsupported cross-repository composition is
+rejected rather than silently merging colliding corpus-local evidence identities.
+
+The qualification suites cover supported contracts and negative controls,
+Unicode/CRLF spans, repeated facts, large values, invalid input, stale references,
+incremental replacement/deletion, output budgets and source non-execution.
+They do not establish runtime scheduler order, actual cleanup, deployed routing,
+installed SDK-version equivalence, complete reactive dependencies, or general
+whole-program type checking. Concept-to-implementation governance and native
+operation/workflow projections are separate work, not implied by this POC.
+
 ## Benchmarks: 0.497 recall@10, 0 LLM credits
 
 | Benchmark | Metric | graphify | Field |

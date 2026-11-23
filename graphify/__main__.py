@@ -840,8 +840,8 @@ def _run_cli() -> None:
     # Skip during install/uninstall (hook writes trigger a fresh check anyway).
     # Skip during hook-check — it runs on every editor tool use and must be silent.
     # Deduplicate paths so platforms sharing the same install dir don't warn twice.
-    _silent_cmds = {"install", "uninstall", "hook-check", "hook-guard"}
-    _FREE_TEXT_CMDS = {"query", "explain", "section", "path", "save-result", "install", "uninstall"}
+    _silent_cmds = {"install", "uninstall", "hook-check", "hook-guard", "semantic-search", "semantic-inspect"}
+    _FREE_TEXT_CMDS = {"query", "explain", "section", "path", "save-result", "install", "uninstall", "semantic-search", "semantic-inspect"}
     _help_flags = {"-h", "--help", "-?"}
     # Version and help only report, so they leave installed files alone (#4545).
     _informational = (
@@ -933,6 +933,11 @@ def _run_cli() -> None:
         print("    --max-concurrency=N     parallel labeling LLM calls (default 4; forced to 1 for ollama/claude-cli)")
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
+        print("  semantic-search [query]  search lossless TypeScript/framework facts; returns exact references")
+        print("    --path P --plugin ID --symbol NAME   constrain source/producer/declaration")
+        print("    --graph PATH --limit N --max-bytes N --cursor C")
+        print("  semantic-inspect REF     inspect grouped facts, coverage and captured source (no inference)")
+        print("    --graph PATH --max-bytes N --cursor C --excerpt-bytes N --excerpt-start B")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --seed X                start at node X (id, label or file path; repeatable)")
@@ -1000,7 +1005,7 @@ def _run_cli() -> None:
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
         print("    --no-gitignore         ignore .gitignore and .git/info/exclude (prioritizes .graphifyignore)")
         print("    --no-cluster            skip clustering, write raw extraction only")
-        print("    --code-only             index code (local AST, no API key) and skip doc/paper/image files")
+        print("    --code-only             index code and deterministic framework evidence; skip doc/paper/image LLMs")
         print("    --postgres DSN          extract schema from a live PostgreSQL database")
         print("                            maps tables, views, functions + FK relationships;")
         print("                            column-level detail is not represented in the graph")

@@ -11963,6 +11963,7 @@ def extract(
     resolution_context_nodes: list[dict] | None = None,
     resolution_context_edges: list[dict] | None = None,
     release_parse_memo: bool = False,
+    framework_root: Path | None = None,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -12006,6 +12007,9 @@ def extract(
         release_parse_memo: no effect; kept so existing callers still work.
             Python resolution no longer memoizes parsed trees, so there is
             nothing to release.
+        framework_root: explicit source namespace for typed evidence. Defaults
+            to root, a cache root that contains the inputs, or the input common
+            parent. Supply a stable root for incremental library calls.
     """
     paths = [Path(p) for p in paths]
     if resolution_context_nodes:
@@ -12054,6 +12058,18 @@ def extract(
             root = Path(*paths[0].parts[:common_len]) if common_len else Path(".")
     except Exception:
         root = Path(".")
+    if framework_root is None:
+        framework_root = anchor_root or root
+        if anchor_root is None and cache_root is not None:
+            candidate = Path(cache_root).resolve()
+            # A cache/output folder outside the explicit input set is not a
+            # source-admission boundary. No directory names are special-cased.
+            if all(
+                path.absolute().is_relative_to(candidate)
+                or (path.absolute().parent.resolve() / path.name).is_relative_to(candidate)
+                for path in paths
+            ):
+                framework_root = candidate
     # An explicit anchor wins. cache_root is only a fallback anchor: it happens to
     # equal the scan root for the no---out CLI path and for watch, but with --out it
     # is the OUTPUT dir, and letting it anchor made every scanned file "out-of-root"
@@ -14122,7 +14138,7 @@ def extract(
 
     _stamp_cpp_condition_provenance(all_nodes, all_edges)
 
-    return {
+    result = {
         "nodes": all_nodes,
         "edges": all_edges,
         "input_tokens": 0,
@@ -14140,6 +14156,13 @@ def extract(
         # not turn a dispatch attempt into permission to delete it (#3411).
         "extracted_sources": [str(p) for p in paths if str(p) not in _failed_seen],
     }
+    from graphify.framework_analysis import analyze_paths
+    evidence = analyze_paths(
+        [p for p in paths if str(p) not in _failed_seen], framework_root or root,
+    )
+    if evidence is not None:
+        result["semantic_evidence"] = evidence
+    return result
 
 
 # Keys of an extract() result that only steer the current run (#2543, #3411).

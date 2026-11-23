@@ -606,6 +606,7 @@ def _stale_graph_sources(
     scan_root: Path,
     seen_files: set[str],
     detection: dict | None = None,
+    *, graph_data: dict | None = None,
 ) -> list[str]:
     """Source files graph.json still references but the current scan no longer
     contains (#1909).
@@ -647,7 +648,7 @@ def _stale_graph_sources(
     """
     from graphify.paths import nfc
     try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        data = graph_data if graph_data is not None else json.loads(graph_path.read_text(encoding="utf-8"))
     except Exception:
         return []
     if not isinstance(data, dict):
@@ -727,7 +728,9 @@ def _stale_graph_sources(
     stale: list[str] = []
     kept_alive: list[str] = []
     checked: set[str] = set()
-    for n in data.get("nodes", []):
+    from graphify.framework_pipeline import evidence_from_data
+    evidence_sources = (evidence_from_data(data) or {}).get("documents", {})
+    for n in [*data.get("nodes", []), *({"source_file": path} for path in evidence_sources)]:
         if not isinstance(n, dict):
             continue
         sf = n.get("source_file")
@@ -791,6 +794,7 @@ def _zero_node_stamped_code_sources(
     scan_root: Path,
     unchanged_code: list[str],
     manifest_path: Path | None = None,
+    *, graph_data: dict | None = None,
 ) -> list[str]:
     """Manifest-stamped code files with a registered extractor but ZERO nodes
     in the existing graph.json (#2543 heal).
@@ -824,7 +828,7 @@ def _zero_node_stamped_code_sources(
             if isinstance(_v, dict) and _v.get("ast_empty"):
                 ast_empty.add(nfc(_k))
     try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        data = graph_data if graph_data is not None else json.loads(graph_path.read_text(encoding="utf-8"))
     except Exception:
         return []
     if not isinstance(data, dict):
@@ -1050,9 +1054,13 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
         h for h in data.get("hyperedges", [])
         if isinstance(h, dict) and h.get("source_file") not in stale
     ]
+    from graphify.framework_pipeline import evidence_from_data, prune_evidence
+    previous_evidence = evidence_from_data(data)
+    prune_evidence(data, stale_sources)
+    evidence_changed = evidence_from_data(data) != previous_evidence
     if n_removed == 0 and len(kept_edges) == len(data.get(links_key, [])) and (
         len(kept_hyper) == len(data.get("hyperedges", []))
-    ):
+    ) and not evidence_changed:
         return 0
     data["nodes"] = kept_nodes
     data[links_key] = kept_edges
@@ -1968,7 +1976,48 @@ def _reenter_main() -> None:
 
 
 def dispatch_command(cmd: str) -> None:
-    if cmd == "provider":
+    if cmd in {"semantic-search", "semantic-inspect"}:
+        import argparse
+        from graphify.framework_evidence import (
+            inspect_semantics, query_semantics, response_json,
+        )
+        from graphify.serve import _read_graph
+        from graphify.paths import default_graph_json
+
+        parser = argparse.ArgumentParser(prog=f"graphify {cmd}")
+        parser.add_argument("value", nargs="?" if cmd == "semantic-search" else None, default="")
+        parser.add_argument("--graph", default=str(default_graph_json()))
+        parser.add_argument("--max-bytes", type=int, default=16384)
+        parser.add_argument("--cursor")
+        if cmd == "semantic-search":
+            parser.add_argument("--path")
+            parser.add_argument("--plugin")
+            parser.add_argument("--symbol")
+            parser.add_argument("--limit", type=int, default=20)
+        else:
+            parser.add_argument("--excerpt-bytes", type=int, default=4096)
+            parser.add_argument("--excerpt-start", type=int)
+        arguments = parser.parse_args(sys.argv[2:])
+        try:
+            graph = _read_graph(arguments.graph)
+            if cmd == "semantic-search":
+                result = query_semantics(
+                    graph, arguments.value, path=arguments.path, plugin=arguments.plugin,
+                    symbol=arguments.symbol, limit=arguments.limit,
+                    max_bytes=arguments.max_bytes, cursor=arguments.cursor,
+                )
+            else:
+                result = inspect_semantics(
+                    graph, arguments.value, max_bytes=arguments.max_bytes, cursor=arguments.cursor,
+                    excerpt_bytes=arguments.excerpt_bytes, excerpt_start=arguments.excerpt_start,
+                )
+            sys.stdout.write(response_json(result))
+            if result.get("status") != "ok":
+                raise SystemExit(4)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+    elif cmd == "provider":
         from graphify.llm import _custom_providers_path, BACKENDS
         import json as _json
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -4661,6 +4710,16 @@ def dispatch_command(cmd: str) -> None:
         # pass; instead we keep incremental_mode = False so all code files are
         # scanned, while merge_existing_graph below ensures build_merge still runs.
         merge_existing_graph = incremental_mode or (code_only and existing_graph_path.exists())
+        _existing_graph_snapshot: dict | None = None
+        _existing_graph_metadata: dict = {}
+        if existing_graph_path.exists():
+            from graphify.build import _load_existing_graph
+            try:
+                _load_existing_graph(existing_graph_path, metadata_out=_existing_graph_metadata)
+            except (RuntimeError, ValueError) as exc:
+                print(f"[graphify extract] Existing graph is invalid or unparseable: {exc}", file=sys.stderr)
+                sys.exit(1)
+            _existing_graph_snapshot = _existing_graph_metadata.get("data")
         if force and code_only and existing_graph_path.exists():
             print(
                 "[graphify extract] --force --code-only: full AST re-scan, "
@@ -4713,7 +4772,7 @@ def dispatch_command(cmd: str) -> None:
             _seen_files = {f for _fl in files_by_type.values() for f in _fl}
             _seen_files.update(detection.get("unclassified", []))
             graph_stale_sources = _stale_graph_sources(
-                existing_graph_path, target, _seen_files, detection=detection
+                existing_graph_path, target, _seen_files, detection=detection, graph_data=_existing_graph_snapshot,
             )
             # #2543 heal: manifests poisoned BEFORE failed-source unstamping
             # existed carry live hashes for code files whose extraction failed
@@ -4726,6 +4785,7 @@ def dispatch_command(cmd: str) -> None:
                 target,
                 detection.get("unchanged_files", {}).get("code", []),
                 manifest_path,
+                graph_data=_existing_graph_snapshot,
             )
             if _healed_sources:
                 print(
@@ -4784,8 +4844,16 @@ def dispatch_command(cmd: str) -> None:
                 _seen_files = {f for _fl in files_by_type.values() for f in _fl}
                 _seen_files.update(detection.get("unclassified", []))
                 graph_stale_sources = _stale_graph_sources(
-                    existing_graph_path, target, _seen_files, detection=detection
+                    existing_graph_path, target, _seen_files, detection=detection, graph_data=_existing_graph_snapshot,
                 )
+
+        from graphify.watch import _framework_refresh_paths, _stamp_framework_state, _framework_complete
+        _framework_fingerprint, _framework_refresh = _framework_refresh_paths(
+            graphify_out, [Path(p) for p in files_by_type.get("code", [])], target,
+        )
+        if incremental_mode and _framework_refresh:
+            code_files = list(dict.fromkeys([*code_files, *_framework_refresh]))
+            print(f"[graphify extract] framework implementation/configuration changed: refreshing {len(_framework_refresh)} admitted source(s), no document LLM refresh")
 
         semantic_files = doc_files + paper_files + image_files
         # --code-only: index code (pure local AST, no key) and skip the semantic
@@ -5068,13 +5136,7 @@ def dispatch_command(cmd: str) -> None:
                 _ctx_edges: list[dict] = []
                 try:
                     from graphify.build import _is_ast_tier as _ctx_is_ast_tier
-                    from graphify.security import (
-                        check_graph_file_size_cap as _ctx_size_cap,
-                    )
-                    _ctx_size_cap(existing_graph_path)
-                    _ctx_graph = json.loads(
-                        existing_graph_path.read_text(encoding="utf-8")
-                    )
+                    _ctx_graph = _existing_graph_snapshot or {}
                     _ctx_root = Path(os.path.abspath(target))
 
                     def _ctx_identity(source_file) -> str | None:
@@ -5231,6 +5293,8 @@ def dispatch_command(cmd: str) -> None:
                 ast_result = _ast_extract(code_files, **ast_kwargs) if code_files else ast_result
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
+                from graphify.watch import _record_framework_failure
+                _record_framework_failure(existing_graph_path, code_files, target, data=_existing_graph_snapshot)
                 # #2445: losing the whole AST pass is fatal by default. The
                 # empty stand-in only reaches the shrink guard when an existing
                 # graph is larger — on a fresh build it used to be written as a
@@ -5238,11 +5302,14 @@ def dispatch_command(cmd: str) -> None:
                 # --allow-partial opts back into the best-effort continuation.
                 if not cli_allow_partial:
                     sys.exit(1)
-                ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+                ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0,
+                              "failed_sources": [str(path) for path in code_files]}
                 _extraction_incomplete = True  # the whole AST pass was lost
             # Only extract() reads the resolution context; free it before the
             # semantic pass and graph build.
             del ast_kwargs
+        _existing_graph_snapshot = None
+        _existing_graph_metadata.clear()
         stages.mark("AST extract")
 
         # Semantic extraction on docs/papers/images. Check cache first.
@@ -5543,6 +5610,15 @@ def dispatch_command(cmd: str) -> None:
             "extracted_sources": list(ast_result.get("extracted_sources", [])),
             "failed_sources": list(ast_result.get("failed_sources", [])),
         }
+        # Only the trusted source analyzer may populate this lane. LLM and
+        # introspection payloads cannot claim typed source evidence.
+        from graphify.framework_pipeline import evidence_from_data as _evidence_from_data
+        _framework_evidence = _evidence_from_data(ast_result)
+        if _framework_evidence is not None:
+            merged["semantic_evidence"] = _framework_evidence
+        _framework_clean = _framework_complete(merged)
+        if not _framework_clean:
+            _extraction_incomplete = True
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
@@ -5810,11 +5886,15 @@ def dispatch_command(cmd: str) -> None:
             from graphify.extract import RUN_ONLY_EXTRACTION_KEYS as _RUN_ONLY_KEYS
             # merge_raw_extraction above has consumed them; graph.json must not
             # carry this run's absolute input paths.
+            from graphify.framework_pipeline import pack_raw_evidence
+            pack_raw_evidence(merged)
             _write_json_atomic(
                 graph_json_path,
                 {k: v for k, v in merged.items() if k not in _RUN_ONLY_KEYS},
                 compact=True,
             )
+            _stamp_framework_state(graphify_out, _framework_fingerprint,
+                                   complete=not _failed_ast_sources and _framework_complete(merged) and not _extraction_incomplete)
             try:
                 # Record the scan root so a later build_merge / update runbook can
                 # relativize deleted-file paths correctly even for a custom --out
@@ -6030,6 +6110,8 @@ def dispatch_command(cmd: str) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        _stamp_framework_state(graphify_out, _framework_fingerprint,
+                               complete=not _failed_ast_sources and _framework_complete({"graph": G.graph}) and not _extraction_incomplete)
         try:
             # See the --no-cluster path above: persist the scan root so build_merge
             # can relativize deleted-file paths under a custom --out (#2012/#1571).

@@ -31,6 +31,7 @@ typos from silently disabling classification.
 """
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -117,7 +118,7 @@ def load_graphifyrc(root: Path) -> dict:
     """Parse ``<root>/.graphifyrc``. Returns ``{}`` when absent.
 
     Returned keys: ``viz_node_limit``, ``query_budget``, ``query_depth`` (ints),
-    and ``languages``
+    ``semantic_module_aliases`` (an explicit API-identity mapping), and ``languages``
     (``{".inc": ".php", ...}``) — each present only when the file sets it.
     Unknown keys are ignored so a newer graphify's options do not break an
     older one. Malformed lines raise ``ValueError`` naming the line.
@@ -163,6 +164,30 @@ def load_graphifyrc(root: Path) -> dict:
                 raise ValueError(
                     f"Invalid {key} in {rc_path} at line {line_num}: {val!r}. "
                     f"Must be {requirement}."
+                ) from exc
+        elif key == "semantic_module_aliases":
+            from graphify.framework_config import normalize_module_aliases
+
+            if key in cfg:
+                raise ValueError(f"Duplicate semantic_module_aliases in {rc_path} at line {line_num}")
+
+            def unique_object(pairs):
+                result = {}
+                for name, value in pairs:
+                    if name in result:
+                        raise ValueError("Duplicate JSON key")
+                    result[name] = value
+                return result
+
+            def reject_constant(value):
+                raise ValueError("Non-JSON numeric constant")
+
+            try:
+                parsed = json.loads(val, object_pairs_hook=unique_object, parse_constant=reject_constant)
+                cfg[key] = normalize_module_aliases(parsed)
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise ValueError(
+                    f"Invalid semantic_module_aliases in {rc_path} at line {line_num}"
                 ) from exc
         elif key.startswith("language."):
             ext_part = key[len("language."):].strip()

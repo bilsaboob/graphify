@@ -1146,6 +1146,7 @@ def _reconcile_existing_graph(
     deleted_source_identities: set[str],
     is_ignored_always: Callable[[Path], bool] | None = None,
     is_ignored_full: Callable[[Path], bool] | None = None,
+    existing_data: dict | None = None,
 ) -> tuple[dict, dict]:
     """Merge fresh extraction with preserved graph entries and evict stale sources.
 
@@ -1170,15 +1171,20 @@ def _reconcile_existing_graph(
     # merely failed to READ. A missing file (None) keeps first-build behavior:
     # reconcile proceeds with an empty baseline and the write is allowed.
     from graphify.build import _load_existing_graph
-    if _load_existing_graph(existing_graph) is None:
-        return result, existing_graph_data
-    # Cap + parse validated above. Reload as the full dict — reconcile needs
-    # top-level keys (hyperedges, per-node community for _node_community_map,
-    # topology compare) the (nodes, edges, hyperedges) tuple does not carry.
-    # A failure here (e.g. a race rewriting the file) still propagates,
-    # staying fail-closed.
-    existing = json.loads(existing_graph.read_text(encoding="utf-8"))
-    existing_graph_data = existing
+    if existing_data is None:
+        metadata: dict = {}
+        if _load_existing_graph(existing_graph, metadata_out=metadata) is None:
+            return result, existing_graph_data
+        existing_data = metadata["data"]
+    existing_graph_data = existing_data
+    existing = {
+        **existing_data,
+        **{key: [dict(item) if isinstance(item, dict) else item for item in existing_data[key]]
+           for key in ("nodes", "links", "edges", "hyperedges") if isinstance(existing_data.get(key), list)},
+    }
+    from graphify.framework_pipeline import combine_evidence, evidence_from_data
+    previous_evidence = evidence_from_data(existing)
+    evidence_from_data(result)  # Validation failures must not become a fresh-only fallback.
 
     # Backfill tier provenance on legacy items (#2334), mirroring
     # build._load_existing_graph (this reconcile path loads the raw dict
@@ -1207,6 +1213,11 @@ def _reconcile_existing_graph(
         rebuilt_source_identities = {
             source_paths.absolute_identity(str(path), project_root) for path in extract_targets
         }
+        failed_identities = {
+            source_paths.absolute_identity(str(path), project_root)
+            for path in result.get("failed_sources", [])
+        }
+        rebuilt_source_identities.difference_update(failed_identities)
         node_evicted_source_identities = set(deleted_source_identities)
         hyperedge_evicted_source_identities = set(deleted_source_identities)
         # Deletion evicts edges regardless of tier; re-extraction only owns a
@@ -1362,6 +1373,19 @@ def _reconcile_existing_graph(
                 edge_evicted_source_identities.add(identity)
                 hyperedge_evicted_source_identities.add(identity)
                 newly_ignored_files.add(identity)
+        # Typed evidence owns real captured sources even when there are no
+        # structural nodes. Corpus absence alone is not deletion authority.
+        evidence_deleted: set[str] = set()
+        for path in (previous_evidence or {}).get("documents", {}):
+            identity = source_paths.absolute_identity(path, project_root)
+            if not identity or not _is_relative_to(Path(identity), watch_root):
+                continue
+            alive = Path(identity).exists()
+            if identity in deleted_source_identities or (
+                identity not in current_sources and (not alive or _ignored_now(identity))
+            ):
+                evidence_deleted.add(path)
+                deleted_paths.add(path)
         if newly_ignored_files:
             print(
                 f"[graphify watch] pruned {newly_ignored_nodes} node(s) from "
@@ -1593,14 +1617,30 @@ def _reconcile_existing_graph(
             if node["id"] not in new_ast_ids or _is_ast_tier(node)
         ]
 
-        return {
+        merged = {
             "nodes": merged_nodes,
             "edges": merged_edges,
             "hyperedges": merged_hyperedges,
             "input_tokens": 0,
             "output_tokens": 0,
-        }, existing_graph_data
+        }
+        metadata = dict(existing.get("graph") or {})
+        metadata.pop("semantic_evidence", None)
+        if metadata:
+            merged["graph"] = metadata
+        evidence = combine_evidence(
+            [result], previous=previous_evidence, root=project_root,
+            replaced_sources=[str(path) for path in extract_targets],
+            deleted_sources=evidence_deleted,
+        )
+        if evidence is not None:
+            merged["semantic_evidence"] = evidence
+        return merged, existing_graph_data
     except Exception as exc:
+        if previous_evidence is not None or "semantic_evidence" in result:
+            # Node counts cannot guard the independent evidence inventory.
+            # Refuse rather than drop it through the structural fallback.
+            raise RuntimeError("Cannot safely reconcile semantic evidence") from exc
         # Post-load reconciliation failure: fall back to the fresh extraction
         # while keeping the loaded baseline, so _check_shrink still guards the
         # write against a collapse. Say so — this used to be silent (#2251).
@@ -2065,6 +2105,84 @@ def _inputs_unchanged(detected: dict, manifest_path: Path, root: Path) -> bool:
 
 
 _BUILD_STATE_NAME = ".graphify_build_state.json"
+_FRAMEWORK_STATE_NAME = ".graphify_framework_state.json"
+
+
+def _framework_refresh_paths(out: Path, paths: list[Path], root: Path, *, configuration_root: Path | None = None) -> tuple[str | None, list[Path]]:
+    """Invalidate deterministic analysis without widening the document/LLM pass."""
+    import hashlib
+    from graphify.framework_analysis import SUPPORTED_SUFFIXES, analysis_fingerprint, options_for_root
+    from graphify.build import _norm_source_file
+
+    selected = [path for path in paths if effective_suffix(path) in SUPPORTED_SUFFIXES]
+    if not selected:
+        return None, []
+    configuration = []
+    for config_root in dict.fromkeys([root, configuration_root or root]):
+        try:
+            configuration.append(hashlib.sha256((config_root / RC_FILENAME).read_bytes()).hexdigest())
+        except FileNotFoundError:
+            configuration.append("")
+    inputs = sorted((_norm_source_file(str(path), str(root)), effective_suffix(path)) for path in selected)
+    fingerprint = hashlib.sha256(json.dumps(
+        [analysis_fingerprint(options=options_for_root(root)), configuration, inputs],
+        ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    try:
+        previous = json.loads((out / _FRAMEWORK_STATE_NAME).read_text(encoding="utf-8"))
+        stat = (out / "graph.json").stat()
+        if previous == {"fingerprint": fingerprint, "graph_size": stat.st_size, "graph_mtime_ns": stat.st_mtime_ns}:
+            return fingerprint, []
+    except (OSError, ValueError):
+        pass
+    return fingerprint, selected
+
+
+def _framework_complete(data: dict) -> bool:
+    from graphify.framework_pipeline import evidence_from_data
+    store = evidence_from_data(data)
+    return all(
+        not entry.get("refreshFailed")
+        and entry["result"]["state"] in {"complete", "not-applicable"}
+        and not entry["result"]["diagnostics"]
+        and all(report["state"] in {"complete", "not-applicable"} and not report["diagnostics"]
+                for report in entry["result"]["reports"])
+        for entry in (store or {}).get("documents", {}).values()
+    )
+
+
+def _stamp_framework_state(out: Path, fingerprint: str | None, *, complete: bool) -> None:
+    path = out / _FRAMEWORK_STATE_NAME
+    if not complete or fingerprint is None:
+        path.unlink(missing_ok=True)
+        return
+    stat = (out / "graph.json").stat()
+    from graphify.paths import write_json_atomic
+    write_json_atomic(path, {"fingerprint": fingerprint, "graph_size": stat.st_size, "graph_mtime_ns": stat.st_mtime_ns})
+
+
+def _record_framework_failure(graph_path: Path, sources: list[Path], root: Path, *, data: dict | None = None) -> None:
+    """Keep prior snapshots but invalidate their current-source claim after a failed pass."""
+    from graphify.build import _load_existing_graph
+    from graphify.framework_pipeline import combine_evidence, evidence_from_data, pack_raw_evidence
+    if data is None:
+        metadata: dict = {}
+        if _load_existing_graph(graph_path, metadata_out=metadata) is None:
+            return
+        data = metadata["data"]
+    previous = evidence_from_data(data)
+    if previous is None:
+        return
+    evidence = combine_evidence([{"failed_sources": [str(path) for path in sources]}], previous=previous, root=root)
+    if evidence != previous:
+        from graphify.export import backup_if_protected
+        from graphify.paths import write_json_atomic
+        candidate = {**data, "graph": {**data.get("graph", {}), "semantic_evidence": evidence}}
+        candidate.pop("semantic_evidence", None)
+        pack_raw_evidence(candidate)
+        backup_if_protected(graph_path.parent)
+        write_json_atomic(graph_path, candidate, compact=True)
+    _stamp_framework_state(graph_path.parent, None, complete=False)
 
 
 def _extractor_epoch() -> str:
@@ -2117,6 +2235,7 @@ def _current_build_state(
     excludes: list[str] | None,
     scan_digest: str,
     code_only: bool = False,
+    framework_fingerprint: str | None = None,
 ) -> dict:
     """Everything besides file content that a rebuild's output depends on (#4740).
 
@@ -2137,6 +2256,7 @@ def _current_build_state(
         rc_digest = ""
     return {
         "epoch": _extractor_epoch(),
+        "framework_fingerprint": framework_fingerprint,
         "scan_root": str(watch_root),
         "scan_digest": scan_digest,
         "follow_symlinks": bool(follow_symlinks),
@@ -2498,7 +2618,6 @@ def _rebuild_code(
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
         from graphify.export import to_json
-        from graphify.security import check_graph_file_size_cap
 
         # Re-apply the excludes the initial extract recorded, so an update/watch/
         # hook rebuild does not silently re-include deliberately excluded paths
@@ -2514,6 +2633,9 @@ def _rebuild_code(
             gitignore=_gitignore_enabled,
         )
         code_files = [Path(f) for f in detected['files']['code']]
+        framework_fingerprint, framework_refresh = _framework_refresh_paths(out, code_files, project_root, configuration_root=watch_root)
+        if changed_paths is not None and framework_refresh:
+            changed_paths = _merge_changed_paths(changed_paths, framework_refresh)
 
         # #3511: `graphify extract` has surfaced files it saw but could not
         # classify since #1692; this update/watch rebuild path never did,
@@ -2554,6 +2676,7 @@ def _rebuild_code(
             excludes=_persisted_excludes,
             scan_digest=_scan_digest(detected),
             code_only=_code_only,
+            framework_fingerprint=framework_fingerprint,
         )
 
         if changed_paths is None and not force:
@@ -2610,7 +2733,7 @@ def _rebuild_code(
                         "[graphify watch] JS/TS resolution inputs changed; rebuilding the full code graph."
                     )
                 else:
-                    changed_paths = [Path(f) for f in (*modified, *deleted_rows)]
+                    changed_paths = _merge_changed_paths([Path(f) for f in (*modified, *deleted_rows)], framework_refresh)
                     scanned = sum(len(v) for v in detected["files"].values())
                     if changed_paths:
                         print(
@@ -2663,6 +2786,14 @@ def _rebuild_code(
         if not code_files and not existing_graph.exists():
             print("[graphify watch] No code files found - nothing to rebuild.")
             return False
+        from graphify.build import _load_existing_graph
+        metadata: dict = {}
+        try:
+            _load_existing_graph(existing_graph, metadata_out=metadata)
+        except (RuntimeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return False
+        existing_snapshot = metadata.get("data", {})
 
         # #1915: a document that already carries SEMANTIC (LLM) nodes in the
         # existing graph must not ALSO be AST-quick-scanned — otherwise every
@@ -2681,8 +2812,7 @@ def _rebuild_code(
         semantic_doc_files: set[Path] = set()
         if ast_doc_files and existing_graph.exists():
             try:
-                check_graph_file_size_cap(existing_graph)
-                prior = json.loads(existing_graph.read_text(encoding="utf-8"))
+                prior = existing_snapshot
                 prior_paths = _StoredSourcePaths(
                     prior,
                     out=out,
@@ -2837,8 +2967,7 @@ def _rebuild_code(
         resolution_context_edges: list[dict] = []
         if changed_paths is not None and existing_graph.exists():
             try:
-                check_graph_file_size_cap(existing_graph)
-                ctx_graph = json.loads(existing_graph.read_text(encoding="utf-8"))
+                ctx_graph = existing_snapshot
                 ctx_paths = _StoredSourcePaths(
                     ctx_graph,
                     out=out,
@@ -2997,15 +3126,20 @@ def _rebuild_code(
                 resolution_context_edges = []
 
         commit = _git_head(cwd=watch_root)
-        result = extract(
-            extract_targets,
-            cache_root=watch_root,
-            resolution_context_nodes=resolution_context_nodes or None,
-            resolution_context_edges=resolution_context_edges or None,
-        ) if extract_targets else {
-            "nodes": [], "edges": [], "hyperedges": [],
-            "input_tokens": 0, "output_tokens": 0,
-        }
+        try:
+            result = extract(
+                extract_targets,
+                cache_root=watch_root,
+                framework_root=project_root,
+                resolution_context_nodes=resolution_context_nodes or None,
+                resolution_context_edges=resolution_context_edges or None,
+            ) if extract_targets else {
+                "nodes": [], "edges": [], "hyperedges": [],
+                "input_tokens": 0, "output_tokens": 0,
+            }
+        except Exception:
+            _record_framework_failure(existing_graph, extract_targets, project_root, data=existing_snapshot)
+            raise
         _rebase_relative_source_files(result, watch_root, project_root)
 
         # #2543: AST sources that failed this run (error result, or extractor
@@ -3014,6 +3148,17 @@ def _rebuild_code(
         # gate reports them unchanged forever and only deleting graphify-out/
         # recovers. Mirrors the extract CLI's _stamped_manifest_files handling.
         _failed_ast_sources = set(result.get("failed_sources") or [])
+        if _failed_ast_sources and existing_snapshot and not force:
+            source_paths = _StoredSourcePaths(
+                existing_snapshot, out=out, project_root=project_root,
+                watch_root=watch_root, normalize_source=_nsf,
+            )
+            failed_identities = {source_paths.absolute_identity(path, watch_root) for path in _failed_ast_sources}
+            if any(_is_ast_tier(node) and source_paths.is_evicted(node, failed_identities)
+                   for node in existing_snapshot.get("nodes", [])):
+                _record_framework_failure(existing_graph, extract_targets, project_root, data=existing_snapshot)
+                print("error: Refusing to overwrite the last good graph after a source extraction failure.", file=sys.stderr)
+                return False
 
         def _ast_manifest_files() -> dict[str, list[str]]:
             """detected["files"] minus this run's failed AST sources (#2543).
@@ -3062,7 +3207,9 @@ def _rebuild_code(
             the gate compares against the outputs too, so it cannot vouch for a
             graph that was half written.
             """
-            _write_build_state(out, _build_state_now, full_clean=changed_paths is None)
+            clean = not _failed_ast_sources and not detected.get("walk_errors") and _framework_complete(result)
+            _write_build_state(out, _build_state_now, full_clean=changed_paths is None and clean)
+            _stamp_framework_state(out, framework_fingerprint, complete=clean)
 
         # Preserve semantic nodes/edges from a previous full run.
         # AST-only rebuild replaces nodes for changed files; everything else is kept.
@@ -3086,6 +3233,7 @@ def _rebuild_code(
                 deleted_source_identities=deleted_source_identities,
                 is_ignored_always=_ignored_always,
                 is_ignored_full=_ignored_full,
+                existing_data=existing_snapshot,
             )
         except (RuntimeError, ValueError) as exc:
             # Existing graph present but unreadable — over the size cap
@@ -3164,24 +3312,12 @@ def _rebuild_code(
             # attribute-less phantom (#2873). Any other edge without two declared
             # endpoints is dropped, as build_from_json drops it.
             _finalize_raw_graph_endpoints(candidate_graph_data)
+            from graphify.framework_pipeline import pack_raw_evidence
+            pack_raw_evidence(candidate_graph_data)
             candidate_graph_text = _json_text(candidate_graph_data)
             same_graph = False
             if existing_graph.exists():
-                try:
-                    check_graph_file_size_cap(existing_graph)
-                    existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
-                except Exception as exc:
-                    # A load failure is NOT "graph changed" (#2251): refuse to
-                    # overwrite a graph we merely failed to read. Normally
-                    # unreachable — the reconcile load above already failed
-                    # closed — but a race rewriting the file can land here.
-                    print(
-                        f"error: Cannot read {existing_graph}: {exc}. "
-                        "Refusing to overwrite; delete the file and run a "
-                        "full rebuild.",
-                        file=sys.stderr,
-                    )
-                    return False
+                existing_payload = existing_graph_data
                 try:
                     same_graph = (
                         json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
@@ -3261,6 +3397,7 @@ def _rebuild_code(
         # update` can't silently downgrade a directed graph to undirected -
         # build_from_json defaults to directed=False otherwise.
         G = build_from_json(result, directed=bool((existing_graph_data or {}).get("directed", False)))
+        G.graph.update(result.get("graph") or {})
         candidate_topology = _topology_from_graph(G)
         if existing_graph_data and not legacy_layout:
             try:
@@ -3440,22 +3577,7 @@ def _rebuild_code(
         same_graph = False
         same_report = False
         if existing_graph.exists():
-            try:
-                check_graph_file_size_cap(existing_graph)
-                existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
-            except Exception as exc:
-                # A load failure is NOT "graph changed" (#2251): refuse to
-                # overwrite a graph we merely failed to read. Normally
-                # unreachable — the reconcile load above already failed
-                # closed — but a race rewriting the file can land here.
-                graph_tmp.unlink(missing_ok=True)
-                print(
-                    f"error: Cannot read {existing_graph}: {exc}. "
-                    "Refusing to overwrite; delete the file and run a "
-                    "full rebuild.",
-                    file=sys.stderr,
-                )
-                return False
+            existing_payload = existing_graph_data
             try:
                 same_graph = (
                     json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)

@@ -54,6 +54,11 @@ def _read_graph(graph_path: str) -> nx.Graph:
     check_graph_file_size_cap(resolved)
     safe = resolved
     data = read_graph_json(safe)
+    from graphify.framework_pipeline import evidence_from_data
+    try:
+        semantic_evidence = evidence_from_data(data)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid framework evidence in {resolved}: {exc}") from exc
     if "links" not in data and "edges" in data:
         data = dict(data, links=data["edges"])
     # Stash the on-disk logical flag before the load-time override below:
@@ -83,6 +88,8 @@ def _read_graph(graph_path: str) -> nx.Graph:
     G = json_graph.node_link_graph(
         dict(data, nodes=consumed(data["nodes"]), links=consumed(data["links"])), edges="links",
     )
+    if semantic_evidence is not None:
+        G.graph["semantic_evidence"] = semantic_evidence
     G.graph["_logical_directed"] = _logical_directed
     # node_link_graph drops top-level keys other than data["graph"], so the
     # build commit export.to_json writes there is stashed by hand (#3354).
@@ -2984,8 +2991,53 @@ def _build_server(graph_path: str):
     async def list_tools() -> list[types.Tool]:
         _tools = [
             types.Tool(
+                name="query_semantics",
+                description=(
+                    "Search indexed TypeScript/TSX framework evidence by source, symbol, vocabulary or plugin. "
+                    "Returns exact source/declaration references and coverage for FST, Solid, JSX, "
+                    "implementation, event, validation and dispatch contracts. Follow references with "
+                    "inspect_semantics. These are qualified static facts, not observed runtime behavior."
+                ),
+                inputSchema={
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "query": {"type": "string", "default": ""},
+                        "path": {"type": "string", "description": "Canonical project-relative source path or prefix"},
+                        "plugin": {"type": "string", "description": "Exact producer ID, e.g. fst-solid or solid"},
+                        "symbol": {"type": "string", "description": "Exact indexed declaration name"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                        "max_bytes": {"type": "integer", "minimum": 256, "maximum": 1048576, "default": 16384},
+                        "cursor": {"type": "string", "description": "Continuation from the same query and limits"},
+                    },
+                },
+            ),
+            types.Tool(
+                name="inspect_semantics",
+                description=(
+                    "Inspect an exact reference returned by query_semantics. Returns grouped declaration "
+                    "roles, properties, relations, vocabulary meanings, exact evidence, a captured-source "
+                    "excerpt, coverage and unresolved references. Complete fact records are paged, never "
+                    "silently clipped. Does not read live source, run analysis or invoke a model."
+                ),
+                inputSchema={
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "reference": {"type": "string", "description": "Exact returned source, declaration or fact reference"},
+                        "cursor": {"type": "string", "description": "Continuation from this same reference and limits"},
+                        "max_bytes": {"type": "integer", "minimum": 256, "maximum": 1048576, "default": 16384},
+                        "excerpt_bytes": {"type": "integer", "minimum": 4, "maximum": 262144, "default": 4096},
+                        "excerpt_start": {"type": "integer", "minimum": 0, "description": "UTF-8 byte boundary in the captured source"},
+                    },
+                    "required": ["reference"],
+                },
+            ),
+            types.Tool(
                 name="query_graph",
-                description="Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
+                description=(
+                    "Search the navigation graph using BFS or DFS. Returns nodes and edges, not execution proof. "
+                    "For indexed TypeScript/FST/Solid roles, lifetimes, JSX, conditions and source-qualified "
+                    "contracts use query_semantics, then inspect_semantics."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -3164,6 +3216,28 @@ def _build_server(graph_path: str):
             }
         return _tools
 
+    def _tool_query_semantics(arguments: dict) -> str:
+        from graphify.framework_evidence import query_semantics, response_json
+        if set(arguments) - {"query", "path", "plugin", "symbol", "limit", "max_bytes", "cursor", "project_path"}:
+            raise ToolError("Unknown query_semantics argument")
+        return response_json(query_semantics(
+            G, arguments.get("query", ""), path=arguments.get("path"),
+            plugin=arguments.get("plugin"), symbol=arguments.get("symbol"),
+            limit=arguments.get("limit", 20), max_bytes=arguments.get("max_bytes", 16384),
+            cursor=arguments.get("cursor"),
+        ))
+
+    def _tool_inspect_semantics(arguments: dict) -> str:
+        from graphify.framework_evidence import inspect_semantics, response_json
+        if set(arguments) - {"reference", "cursor", "max_bytes", "excerpt_bytes", "excerpt_start", "project_path"}:
+            raise ToolError("Unknown inspect_semantics argument")
+        return response_json(inspect_semantics(
+            G, arguments["reference"], cursor=arguments.get("cursor"),
+            max_bytes=arguments.get("max_bytes", 16384),
+            excerpt_bytes=arguments.get("excerpt_bytes", 4096),
+            excerpt_start=arguments.get("excerpt_start"),
+        ))
+
     def _tool_query_graph(arguments: dict) -> str:
         import time as _time
         from graphify import querylog
@@ -3228,7 +3302,10 @@ def _build_server(graph_path: str):
                f"{sanitize_label(str(d.get('definition_location', '')))}"]
               if d.get("definition_file") else []),
             *(["  Section: get_section returns this Markdown section's text"]
-              if _is_section_node(d) else []),
+               if _is_section_node(d) else []),
+            *(["  Framework evidence: use query_semantics with this source path, then inspect_semantics "
+               "with a returned exact reference (file association only, not a guessed symbol binding)"]
+              if str(d.get("source_file", "")) in (G.graph.get("semantic_evidence") or {}).get("documents", {}) else []),
             f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
             f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
             f"  Degree: {G.degree(nid)}",
@@ -3427,6 +3504,8 @@ def _build_server(graph_path: str):
         return "\n\n".join(lines)
 
     _handlers = {
+        "query_semantics": _tool_query_semantics,
+        "inspect_semantics": _tool_inspect_semantics,
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
         "get_section": _tool_get_section,
@@ -3527,6 +3606,8 @@ def _build_server(graph_path: str):
             # an error result; the 2.x path catches it in _on_call_tool).
             raise
         except Exception as exc:
+            if name in {"query_semantics", "inspect_semantics"}:
+                raise ToolError(f"Error executing {name}: {exc}") from exc
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
 
     if hasattr(Server, "list_tools"):

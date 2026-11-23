@@ -331,6 +331,28 @@ its inferred edge while retaining the existing callee/receiver deduplication.
 This is static branch-wise syntax coverage, not proof that all branches execute together.
 AST cache schema 43 invalidates older template and conditional recovery records.
 
+## Typed framework evidence
+
+The v8-zen TypeScript lane is owned by this repository. `framework_analysis.py`
+serializes the admitted Tree-sitter snapshot into a bounded data-only request to
+`semantic_node/worker.mjs`. The worker contains the source-only core, TypeScript
+view and reviewed FST/Solid/component/local-fact producers; it neither loads Zen
+nor executes the target project's imports.
+
+`framework_evidence.py` validates and stores exact source/declaration/fact
+identities, manifests, coverage and captured source. `framework_pipeline.py`
+carries that data through full/raw builds, replacement, pruning and export.
+Graph JSON has one canonical `graph.semantic_evidence` container. It is not node
+display metadata and must not be sanitized, collapsed or inferred from names.
+The navigation graph remains a projection; losing its parallel edge occurrences
+must not lose authoritative semantic occurrences.
+
+`query_semantics` and `inspect_semantics` expose this structured evidence through
+MCP, with `semantic-search` and `semantic-inspect` CLI counterparts. Queries use
+published snapshots and exact returned references, with bounded JSON output and
+explicit continuation/unsupported results. Framework facts are qualified source
+contracts, not a compiler-program, Concept registry, or runtime execution proof.
+
 ## Adding a new language extractor
 
 1. Add an `extract_<lang>(path: Path) -> dict` function following the existing pattern (tree-sitter parse → walk nodes → collect `nodes` and `edges` → call-graph second pass for INFERRED `calls` edges). New languages go in their own module under `graphify/extractors/` - see `graphify/extractors/MIGRATION.md`; `extract.py` re-exports them while the existing ones are ported out of it.

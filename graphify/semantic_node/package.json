@@ -1,0 +1,23 @@
+{
+  "name": "graphify-semantic-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "imports": {
+    "#core": "./src/core/index.ts",
+    "#core/*": "./src/core/*.ts",
+    "#typescript": "./src/typescript/index.ts",
+    "#typescript/*": "./src/typescript/*.ts"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit --module nodenext --moduleResolution nodenext --resolveJsonModule --target es2022 --strict --noUncheckedIndexedAccess --skipLibCheck src/worker.ts",
+    "test": "node build.mjs && node --test test/*.test.mjs test/frameworks/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.24",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3"
+  }
+}

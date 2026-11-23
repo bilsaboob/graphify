@@ -1,0 +1,2 @@
+# Index the owned analyzer source, not the generated duplicate bundle.
+graphify/semantic_node/worker.mjs

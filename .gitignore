@@ -10,6 +10,9 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+graphify/semantic_node/node_modules/
+!graphify/semantic_node/src/core/
+!graphify/semantic_node/src/core/**
 *.so
 *.egg
 .graphify/
