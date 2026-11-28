@@ -2552,7 +2552,7 @@ def extract_js(path: Path) -> dict:
                     if normalized[match.start():match.start() + 6] != b'import'
                 )
             working = normalized if normalized is not None else working
-            source_override = working if working is not source else None
+            source_override = working
         except OSError:
             pass
     result = _extract_generic(path, config, source_override=source_override)
@@ -2894,6 +2894,11 @@ def _emit_rescued_import(
     if resolution is None:
         return
     node_id, stub_source_file, resolved_file, is_external = resolution
+    if resolved_file is None and not is_external and active_scan_root() is not None:
+        # Missing local targets still have a project-relative reference identity,
+        # without private-root leakage or lossy-slug collisions between paths.
+        target = Path(os.path.relpath(stub_source_file, active_scan_root())).as_posix()
+        node_id = _make_id("ref", target, hashlib.sha256(target.encode("utf-8")).hexdigest())
     edge = {
         "source": file_node_id, "target": node_id,
         "relation": relation, "confidence": "EXTRACTED",
@@ -2911,24 +2916,13 @@ def _emit_rescued_import(
         return
     stub: dict = {
         "id": node_id, "label": raw,
-        "file_type": "code", "source_file": stub_source_file,
+        "file_type": "concept", "type": "external", "external": True,
+        "source_file": "",
         "confidence": "EXTRACTED",
     }
     if is_external:
-        # A bare/scoped specifier names a MODULE, not a path: the same package
-        # imported from N files is one node, and it is the same package a
-        # manifest in the corpus declares under that name. Mark it the way Swift
-        # module anchors are marked (#1327) — `file_type=code` keeps build.py
-        # validation happy, `type=module` exempts it from id-disambiguation — so
-        # it collapses with that declaration instead of being salted apart from
-        # it. Without this the salt renames the node and every importing edge is
-        # left on the dead id, so a declared dependency silently loses all of its
-        # inbound edges while an undeclared one keeps them (#3084).
-        stub["type"] = "module"
-        # For an external, `stub_source_file` is the package name (see
-        # _resolve_rescued_specifier) — and the node IS that package, so name it
-        # that way. `lodash/fp/map` and `lodash/debounce` are one `lodash` node,
-        # and neither subpath should end up titling it.
+        # Package and missing-file references own no captured source. Keep the
+        # package identity/label shared across importers and manifest declarations.
         stub["label"] = stub_source_file
     result.setdefault("nodes", []).append(stub)
     result.setdefault("edges", []).append(edge)
@@ -10285,11 +10279,8 @@ register_language_resolver(
 # heading --references--> symbol edges once every file is extracted and ids are
 # final. Lives in graphify.markdown_resolution; the shared call pass above skips
 # these raw_calls so a mention is never mistaken for a call.
-register_language_resolver(
-    LanguageResolver(
-        "markdown_mentions", MARKDOWN_MENTION_SUFFIXES, resolve_markdown_mentions
-    )
-)
+# Markdown references run below with the explicit source namespace, which is
+# needed when fresh documents and cached code use different path forms.
 
 
 # Inline markdown link: [text](target "optional title"). The negative lookbehind
@@ -11638,23 +11629,33 @@ def _get_extractor(path: Path, *, sniff_headers: bool = True) -> Any | None:
     return _DISPATCH.get(suffix)
 
 
-def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
+def _safe_extract_with_xaml_root(extractor, path: Path, root: Path, annotation_run=None) -> dict:
     # Publish the in-flight scan root on extractors.base (the correct import
     # direction) so root-dependent extractors — Markdown link resolution, the
     # XAML C# project clamp — can read it without reaching back into this module
     # (#3666). Despite the XAML-era name this wraps every extractor.
     previous_root = set_active_scan_root(root.resolve())
+    from graphify.extractors.base import source_capture
+    from graphify.native_annotations import activate, deactivate
+    token = activate(annotation_run)
     try:
-        return _safe_extract(extractor, path, scan_root=root)
+        with source_capture(path) as capture:
+            result = _safe_extract(extractor, path, scan_root=root)
+            if "_annotation" in result:
+                result["_annotation_snapshot"] = (path, capture["original_hash"])
+            return result
     finally:
+        deactivate(token)
         set_active_scan_root(previous_root)
 
 
-def _worker_init(language_overrides: dict[str, str]) -> None:
+def _worker_init(language_overrides: dict[str, str], annotation_run=None) -> None:
     """Pool initializer. Under ``spawn`` a worker re-imports the package and
     starts with no overrides; hand it the parent's so `_get_extractor` and the
     cache key agree across processes (#2961)."""
     set_language_overrides(language_overrides)
+    from graphify.native_annotations import activate
+    activate(annotation_run)
 
 
 def _extract_single_file(args: tuple) -> tuple[int, dict]:
@@ -11672,6 +11673,8 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
+    from graphify.native_annotations import current_run
+    annotation_run = current_run()
     if len(args) == 4:
         idx, path_str, root_str, cache_location_str = args
     else:  # legacy 3-tuple: location == anchor
@@ -11681,7 +11684,8 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     root = Path(root_str)
     cache_location = Path(cache_location_str)
     _raise_recursion_limit()
-    bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES
+    # Markdown cache hashes omit frontmatter; parse it freshly to keep spans current.
+    bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES or path.suffix.lower() == ".md"
 
     # Check cache first (avoid re-extraction)
     if not bypass_cache:
@@ -11693,7 +11697,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
-    result = _safe_extract_with_xaml_root(extractor, path, root)
+    result = _safe_extract_with_xaml_root(extractor, path, root, annotation_run)
     # Never cache a zero-node result for an extractable file. Every supported
     # source produces at least a file node, so an empty node list is anomalous
     # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
@@ -11788,6 +11792,7 @@ def _extract_parallel(
     max_workers: int | None,
     total_files: int,
     cache_location: Path | None = None,
+    annotation_run=None,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -11831,7 +11836,7 @@ def _extract_parallel(
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_worker_init,
-            initargs=(get_language_overrides(),),
+            initargs=(get_language_overrides(), annotation_run),
         ) as pool:
             futures = {
                 pool.submit(_extract_single_file, item): pos
@@ -11898,7 +11903,7 @@ def _extract_parallel(
         # a second failure into an error-carrying result.
         _extract_sequential(
             [uncached_work[pos] for pos in failed],
-            per_file, root, total_files, cache_location,
+            per_file, root, total_files, cache_location, annotation_run,
         )
     if total_files >= _PROGRESS_INTERVAL:
         # Report the same denominator the intermediate lines used (uncached files
@@ -11919,6 +11924,8 @@ def _extract_sequential(
     root: Path,
     total_files: int,
     cache_location: Path | None = None,
+    annotation_run=None,
+    file_progress=None,
 ) -> None:
     """Extract uncached files sequentially (fallback for small batches)."""
     _PROGRESS_INTERVAL = 100
@@ -11933,12 +11940,18 @@ def _extract_sequential(
                 flush=True,
             )
         extractor = _get_extractor(path)
+        if file_progress is not None:
+            file_progress(path, None)
         if extractor is None:
             per_file[idx] = {"nodes": [], "edges": []}
+            if file_progress is not None:
+                file_progress(path, per_file[idx])
             continue
-        bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES
+        bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES or path.suffix.lower() == ".md"
         # XAML boundary anchors on `root` (the corpus), not the cache location.
-        result = _safe_extract_with_xaml_root(extractor, path, root)
+        result = _safe_extract_with_xaml_root(extractor, path, root, annotation_run)
+        if file_progress is not None:
+            file_progress(path, result)
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666),
         # but cache intentional declines/virtual manifests carrying `skipped` (#3910).
         if not bypass_cache and "error" not in result and (result.get("nodes") or result.get("skipped")):
@@ -11964,6 +11977,7 @@ def extract(
     resolution_context_edges: list[dict] | None = None,
     release_parse_memo: bool = False,
     framework_root: Path | None = None,
+    file_progress=None,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -12138,7 +12152,7 @@ def extract(
             per_file[i] = {"nodes": [], "edges": []}
             no_extractor += 1
             continue
-        bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES
+        bypass_cache = effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES or path.suffix.lower() == ".md"
         if not bypass_cache:
             cached = load_cached(path, root, cache_root=cache_location, salt=cache_salt(path))
             if cached is not None:
@@ -12159,6 +12173,8 @@ def extract(
         )
 
     # Phase 2: extract uncached files (parallel or sequential)
+    from graphify.native_annotations import prepare_run, collect as collect_annotations, verify_run
+    annotation_run = prepare_run(Path(framework_root or root), paths)
     if uncached_work:
         # Skip the pool up front when spawn workers could not re-import our
         # __main__ (stdin/-c/REPL) — otherwise every worker dies on bootstrap and
@@ -12181,9 +12197,9 @@ def extract(
             )
             parallel = False
         ran_parallel = False
-        if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
+        if parallel and file_progress is None and len(uncached_work) >= _PARALLEL_THRESHOLD:
             ran_parallel = _extract_parallel(
-                uncached_work, per_file, root, max_workers, total, cache_location
+                uncached_work, per_file, root, max_workers, total, cache_location, annotation_run
             )
         if not ran_parallel:
             # #2444: only re-extract what the pool didn't finish. A pool that
@@ -12191,7 +12207,7 @@ def extract(
             # the whole batch would throw that work away.
             _extract_sequential(
                 [(i, p) for (i, p) in uncached_work if per_file[i] is None],
-                per_file, root, total, cache_location,
+                per_file, root, total, cache_location, annotation_run, file_progress,
             )
 
     # Fill any remaining None slots. With the #2444/#2445 handling above this
@@ -12444,6 +12460,7 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
+    evidence, annotation_snapshots = collect_annotations(annotation_run, per_file)
     for result in per_file:
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
@@ -13904,10 +13921,14 @@ def extract(
         _rl_edges = all_edges + list(resolution_context_edges or [])
         _n0, _e0 = len(_rl_nodes), len(_rl_edges)
         run_language_resolvers(paths, per_file, _rl_nodes, _rl_edges)
+        if any(p.suffix.lower() in MARKDOWN_MENTION_SUFFIXES for p in paths):
+            resolve_markdown_mentions(per_file, _rl_nodes, _rl_edges, scan_root=root)
         all_nodes.extend(_rl_nodes[_n0:])
         all_edges.extend(_rl_edges[_e0:])
     else:
         run_language_resolvers(paths, per_file, all_nodes, all_edges)
+        if any(p.suffix.lower() in MARKDOWN_MENTION_SUFFIXES for p in paths):
+            resolve_markdown_mentions(per_file, all_nodes, all_edges, scan_root=root)
     # Every call is resolved. Half of the corpus's rows are these.
     del all_raw_calls, per_file
 
@@ -14156,12 +14177,25 @@ def extract(
         # not turn a dispatch attempt into permission to delete it (#3411).
         "extracted_sources": [str(p) for p in paths if str(p) not in _failed_seen],
     }
-    from graphify.framework_analysis import analyze_paths
-    evidence = analyze_paths(
-        [p for p in paths if str(p) not in _failed_seen], framework_root or root,
-    )
+    verify_run(annotation_run, annotation_snapshots)
     if evidence is not None:
         result["semantic_evidence"] = evidence
+        from graphify.build import _norm_source_file
+        redacted = {
+            path: {
+                "policy": entry["redaction"]["policy"],
+                "originalSourceHash": entry["redaction"]["originalSourceHash"],
+                "indexedSourceHash": entry["result"]["sourceHash"],
+                "rangeCount": len(entry["redaction"]["ranges"]),
+            }
+            for path, entry in evidence["documents"].items() if "redaction" in entry
+        }
+        if redacted:
+            for records in (all_nodes, all_edges):
+                for record in records:
+                    source_path = _norm_source_file(record.get("source_file"), str(framework_root or root))
+                    if source_path in redacted:
+                        record["source_redaction"] = redacted[source_path]
     return result
 
 
@@ -14170,7 +14204,7 @@ def extract(
 # raw extraction as graph.json (--no-cluster) must leave them out: they put the
 # checkout path and OS username into the graph, and differ between the first
 # build and a rebuild of the same tree.
-RUN_ONLY_EXTRACTION_KEYS = frozenset({"extracted_sources", "failed_sources", "skipped_sources"})
+RUN_ONLY_EXTRACTION_KEYS = frozenset({"extracted_sources", "failed_sources", "skipped_sources", "_partial_files"})
 
 
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:

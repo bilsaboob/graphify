@@ -1,6 +1,7 @@
 """Markdown extractor. Moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
+import hashlib
 import re
 import os
 import unicodedata
@@ -9,7 +10,7 @@ from pathlib import Path
 from urllib.parse import unquote
 from graphify.detect import CODE_EXTENSIONS, DOC_EXTENSIONS, classify_file
 from graphify.extractors.base import _file_stem, _make_id, _read_source_text
-from graphify.security import sanitize_metadata
+from graphify.security import redact_secrets, sanitize_metadata
 
 
 # A link destination is either <bracketed>, the only CommonMark form that may
@@ -33,7 +34,7 @@ _MD_REF_DEF_RE = re.compile(
 # carries the citation evidence for its section (#4804).
 _MD_REF_LINK_RE = re.compile(r'(?<!\!)\[([^\]]*)\]\[([^\]]*)\]')
 
-_MD_WIKILINK_RE = re.compile(r'(?<!\!)\[\[([^\]|#]+?)(?:\\?\|[^\]]*|#[^\]]*)?\]\]')
+_MD_WIKILINK_RE = re.compile(r'(?<!\!)\[\[([^\]|]+?)(?:\\?\|[^\]]*)?\]\]')
 
 # Document extensions a Markdown link may point at for a `references` edge, and
 # the extensions the Obsidian wikilink index covers.
@@ -82,6 +83,18 @@ _MD_ATX_CLOSING_RE = re.compile(r'(?:^|[ \t]+)#+[ \t]*$')
 # the line (an info string on an opener). Leading whitespace is accepted at any
 # depth, as before, so a fence inside a nested list item still counts.
 _MD_FENCE_RE = re.compile(r'^\s*(`{3,}|~{3,})(.*)$')
+
+# Only code-shaped tokens, not every word in an example (which may be prose).
+_MD_EXAMPLE_HINT_RE = re.compile(
+    r'(?<![\w/\\])(?:[A-Za-z0-9_./@\\-]+\.[A-Za-z0-9_]+'
+    r'(?:::[A-Za-z_]\w*)*|[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)+'
+    r'|[A-Za-z_]\w*(?=\s*\())(?:\(\))?'
+)
+_MD_EXAMPLE_IMPORT_RE = re.compile(
+    r'\b(?:from|import|use|using)\s+([A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*)'
+    r'|\bimport\s*\{([^}]+)\}'
+    r'|\b(?:from|require|import)\s*\(?\s*[\'"]([^\'"\n]+)[\'"]'
+)
 
 
 def _fence_open(line: str) -> "tuple[str, int] | None":
@@ -308,8 +321,9 @@ def _percent_decoded(target: str, source_dir: Path) -> str:
     if decoded == target:
         return target
     literal = target if Path(target).suffix else target + ".md"
+    from graphify.input_snapshot import permits_source_path
     try:
-        if (source_dir / literal).is_file():
+        if permits_source_path(source_dir / literal) and (source_dir / literal).is_file():
             return target
     except OSError:
         pass
@@ -381,8 +395,9 @@ def _resolve_markdown_link(raw: str, source_dir: Path,
         # the link only when that document exists. A literal target graphify
         # indexes itself ([[pic.png]] beside pic.png.md) keeps precedence.
         literal = Path(os.path.normpath(str(source_dir / target)))
+        from graphify.input_snapshot import permits_source_path
         try:
-            if literal.is_file() and classify_file(literal) is not None:
+            if permits_source_path(literal) and literal.is_file() and classify_file(literal) is not None:
                 return None
             hit = _resolve_markdown_link(target + ".md", source_dir, wikilink=True)
             return hit if hit is not None and hit.is_file() else None
@@ -392,6 +407,10 @@ def _resolve_markdown_link(raw: str, source_dir: Path,
     if not candidate.is_absolute():
         candidate = source_dir / candidate
     resolved = Path(os.path.normpath(str(candidate)))
+    from graphify.input_snapshot import snapshot_root
+    boundary = snapshot_root()
+    if boundary is not None and not resolved.absolute().is_relative_to(boundary):
+        return None
     if wikilink and not Path(target).is_absolute():
         try:
             missing = not resolved.is_file()
@@ -465,6 +484,8 @@ def extract_markdown(path: Path) -> dict:
     - The file itself, tagged ``node_kind: "page"``, carrying any YAML
       frontmatter under ``frontmatter``
     - Each heading (# / ## / ### etc.), tagged ``node_kind: "heading"``
+    - Each fenced example, tagged ``node_kind: "code_example"``, with a bounded
+      redacted preview and an inclusive whole-fence source span
 
     ``node_kind`` exists because ``file_type`` cannot carry this distinction:
     it is a closed enum (build.py rewrites anything outside
@@ -505,10 +526,9 @@ def extract_markdown(path: Path) -> dict:
     becomes a ``calls`` edge.
 
     Fenced code blocks (``` ... ``` or ~~~ ... ~~~, closed by a run of the
-    same character at least as long, per CommonMark) are skipped during
-    parsing so their contents don't get treated as headings, but no node is emitted for
-    them — they were always orphans (only a single contains edge to the
-    parent doc) and inflated the disconnected-component count (#1077).
+    same character at least as long, per CommonMark) remain documentation,
+    never declarations or production calls. Inline and example code hints are
+    persisted on their document owners even when no code symbol resolves.
 
     Leading YAML frontmatter is parsed onto the page node and excluded from
     heading detection (a `#` there is a YAML comment). Links inside it are
@@ -520,18 +540,41 @@ def extract_markdown(path: Path) -> dict:
     try:
         source = _read_source_text(path)
     except Exception as e:
-        return {"nodes": [], "edges": [], "error": str(e)}
+        return {"nodes": [], "edges": [], "error": redact_secrets(str(e))}
 
-    stem = _file_stem(path)
-    str_path = str(path)
+    str_path = redact_secrets(str(path))
+    stem = _file_stem(Path(str_path))
     nodes: list[dict] = []
     edges: list[dict] = []
     raw_calls: list[dict] = []
-    seen_ids: set[str] = set()
+    nodes_by_id: dict[str, dict] = {}
     seen_mentions: set[tuple[str, "str | None", tuple[str, ...]]] = set()
 
-    def add_mention(caller_nid: str, span: str, line: int) -> None:
+    def add_hint(owner: str, span: str, line: int, role: str | None = None,
+                 path_hint: bool = False) -> tuple[str | None, list[str]] | None:
+        span = redact_secrets(span).strip()
+        if not span:
+            return None
         mention = _code_span_mention(span)
+        hint: dict = {"text": span, "source_location": f"L{line}"}
+        if mention is not None:
+            cited_path, names = mention
+            if cited_path is not None:
+                hint["path"] = cited_path
+            if len(names) > 1:
+                hint["qualifiers"] = names[:-1]
+        if role:
+            hint["role"] = role
+        if path_hint:
+            hint["path"] = span
+        hints = nodes_by_id[owner].setdefault("attributes", {}).setdefault("code_hints", [])
+        if hint not in hints:
+            hints.append(hint)
+        return mention
+
+    def add_mention(caller_nid: str, span: str, line: int) -> None:
+        span = redact_secrets(span)
+        mention = add_hint(caller_nid, span, line)
         if mention is None:
             return
         cited_path, names = mention
@@ -562,13 +605,13 @@ def extract_markdown(path: Path) -> dict:
 
     def add_node(nid: str, label: str, line: int, file_type: str = "document",
                  node_kind: str = "heading", extra: "dict | None" = None) -> None:
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            node = {"id": nid, "label": label, "file_type": file_type,
+        if nid not in nodes_by_id:
+            node = {"id": nid, "label": redact_secrets(label), "file_type": file_type,
                     "node_kind": node_kind,
                     "source_file": str_path, "source_location": f"L{line}"}
             if extra:
                 node.update(extra)
+            nodes_by_id[nid] = node
             nodes.append(node)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -583,7 +626,8 @@ def extract_markdown(path: Path) -> dict:
 
     lines = source.splitlines()
     fm_lines, body_start = _split_frontmatter(lines)
-    frontmatter = sanitize_metadata(_parse_frontmatter(fm_lines))
+    frontmatter = sanitize_metadata(_parse_frontmatter(
+        redact_secrets("\n".join(fm_lines)).splitlines()))
 
     # Pre-scan reference definitions so a use can resolve to a definition that
     # appears later in the document (#4804). Fenced code blocks are skipped.
@@ -603,7 +647,7 @@ def extract_markdown(path: Path) -> dict:
             if _url:
                 ref_defs[_label] = _url
 
-    file_nid = _make_id(str(path))
+    file_nid = _make_id(str_path)
     add_node(file_nid, path.name, 1, node_kind="page",
              extra={"frontmatter": frontmatter} if frontmatter else None)
 
@@ -624,6 +668,14 @@ def extract_markdown(path: Path) -> dict:
 
     def add_link(raw: str, line: int, owner: str = file_nid,
                  wikilink: bool = False) -> None:
+        # Preserve authored destinations even when no scanned target can bind.
+        target = redact_secrets(raw)
+        hint = {"target": target, "source_location": f"L{line}"}
+        links = nodes_by_id[owner].setdefault("attributes", {}).setdefault("document_links", [])
+        if hint not in links:
+            links.append(hint)
+        if target != raw:
+            return
         resolved = _resolve_markdown_link(raw, source_dir, wikilink=wikilink,
                                           exts=_MD_CITEABLE_EXTS)
         if resolved is None:
@@ -637,6 +689,7 @@ def extract_markdown(path: Path) -> dict:
                 ).replace("\\", "/")
             except ValueError:  # different drives on Windows
                 cited = str(resolved).replace("\\", "/")
+            cited = redact_secrets(cited)
             key = (owner, cited)
             if key in seeded_citations:
                 return
@@ -660,7 +713,7 @@ def extract_markdown(path: Path) -> dict:
         # _file_node_id(rel) by the extract() post-pass). Using the absolute
         # resolved path means both endpoints get remapped identically, so the
         # edge merges into the existing doc node instead of spawning a ghost.
-        tgt_nid = _make_id(str(resolved))
+        tgt_nid = _make_id(redact_secrets(str(resolved)))
         if tgt_nid == file_nid or tgt_nid in linked_targets:
             return
         linked_targets.add(tgt_nid)
@@ -675,7 +728,7 @@ def extract_markdown(path: Path) -> dict:
         target_file = None
         try:
             if resolved.is_file():
-                target_file = str(resolved)
+                target_file = redact_secrets(str(resolved))
         except OSError:
             pass
         add_edge(file_nid, tgt_nid, "references", line, target_file=target_file)
@@ -683,19 +736,60 @@ def extract_markdown(path: Path) -> dict:
     # Track heading stack for nesting: [(level, nid), ...]
     heading_stack: list[tuple[int, str]] = []
     fence: "tuple[str, int] | None" = None  # (char, length) of the open fence
+    fence_start = 0
+
+    def add_example(end_line: int, *, closed: bool) -> None:
+        if fence_start <= body_start:
+            return
+        owner = heading_stack[-1][1] if heading_stack else file_nid
+        nid = _make_id(stem, "code_example", str(fence_start))
+        while nid in nodes_by_id:
+            nid += "_example"
+        block = redact_secrets("\n".join(lines[fence_start - 1:end_line]))
+        content = "\n".join(lines[fence_start:end_line - int(closed)])
+        safe_content = redact_secrets(content)
+        opener = _MD_FENCE_RE.match(lines[fence_start - 1])
+        assert opener is not None
+        info = redact_secrets(opener.group(2)).split()
+        language = info[0][:64] if info else ""
+        add_node(nid, f"Example {language or 'code'} at L{fence_start}", fence_start,
+                 node_kind="code_example", extra={"attributes": {
+                     "start_line": fence_start, "end_line": end_line,
+                     "language": language, "preview": safe_content[:512],
+                     "section": nodes_by_id[owner]["label"],
+                     "span_hash": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+                 }})
+        add_edge(owner, nid, "contains", fence_start)
+        same_line_count = content.count("\n") == safe_content.count("\n")
+        for offset, text in enumerate(safe_content.splitlines(), 1):
+            # A multiline credential can collapse lines; cite the whole example
+            # rather than inventing a precise line after that redaction.
+            line = fence_start + offset if same_line_count else fence_start
+            for match in _MD_EXAMPLE_HINT_RE.finditer(text):
+                if match.group().rstrip("()") not in {"if", "for", "while", "switch", "catch"}:
+                    add_hint(nid, match.group(), line, "example")
+            for match in _MD_EXAMPLE_IMPORT_RE.finditer(text):
+                if match.group(3):
+                    add_hint(nid, match.group(3), line, "example", path_hint=True)
+                    continue
+                imported = match.group(1) or match.group(2)
+                for name in re.findall(r'[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*', imported):
+                    if name not in {"as", "type"}:
+                        add_hint(nid, name, line, "example")
 
     for line_num_0, line_text in enumerate(lines):
         line_num = line_num_0 + 1
 
-        # Skip over fenced code blocks so their contents are not parsed as
-        # headings, but do not emit nodes/edges for them (#1077).
+        # Preserve examples without parsing their contents as document structure.
         if fence is not None:
             if _fence_closes(line_text, fence):
+                add_example(line_num, closed=True)
                 fence = None
             continue
         opened = _fence_open(line_text)
         if opened is not None:
             fence = opened
+            fence_start = line_num
             continue
 
         # Inside the frontmatter block a leading `#` is a YAML comment, not an
@@ -721,12 +815,12 @@ def extract_markdown(path: Path) -> dict:
 
         # Detect headings: # Heading, ## Heading, etc.
         heading_match = _MD_ATX_HEADING_RE.match(line_text)
-        title = _MD_ATX_CLOSING_RE.sub("", heading_match.group(2).strip()) if heading_match else ""
+        title = redact_secrets(_MD_ATX_CLOSING_RE.sub("", heading_match.group(2).strip())) if heading_match else ""
         if heading_match and title:
             level = len(heading_match.group(1))
             h_nid = _make_id(stem, title)
             # Avoid duplicate heading IDs by appending line number
-            if h_nid in seen_ids:
+            if h_nid in nodes_by_id:
                 h_nid = _make_id(stem, title, str(line_num))
             add_node(h_nid, title, line_num)
 
@@ -776,6 +870,9 @@ def extract_markdown(path: Path) -> dict:
                 add_link(_url, line_num, owner=file_nid)
         for m in _MD_CODE_SPAN_RE.finditer(line_text):
             add_mention(owner, m.group(2), line_num)
+
+    if fence is not None:
+        add_example(len(lines), closed=False)
 
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls,
             "input_tokens": 0, "output_tokens": 0}

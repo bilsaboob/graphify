@@ -7991,13 +7991,20 @@ def _extract_generic(
 
     try:
         source = _read_source_bytes(path) if source_override is None else source_override
+        if source_override is not None and config.ts_module == "tree_sitter_typescript":
+            from graphify.security import redact_source_credentials
+            safe, _ = redact_source_credentials(
+                source.decode("utf-8"),
+                "tsx" if config.ts_language_fn == "language_tsx" else "typescript",
+            )
+            source = safe.encode("utf-8")
         if config.ts_module == "tree_sitter_cpp":
             # Persisted lookup offsets and call sites must share line-ending-independent bytes.
             source = source.replace(b"\r\n", b"\n")
         # In C and C++, if the .h file does not end with a newline '\n' an error
         # is throwed even if the file is valid. In order to avoid this, a new line
         # char is added only if the original file does not end with it.
-        if source and not source.endswith(b"\n"):
+        if config.ts_module != "tree_sitter_typescript" and source and not source.endswith(b"\n"):
             source = source + b"\n"
         tree = parser.parse(source)
         root = tree.root_node
@@ -13341,6 +13348,10 @@ def _extract_generic(
             result["cpp_type_table"] = {"path": str_path, "table": type_table}
         elif config.ts_module == "tree_sitter_php":
             result["php_type_table"] = {"path": str_path, "table": type_table}
+    from graphify.native_annotations import annotate_parse
+    annotation = annotate_parse(path, source, tree, config, parser)
+    if annotation is not None:
+        result["_annotation"] = annotation
     return result
 
 def _ts_mark_public_twins(root, source: bytes, result: dict) -> None:

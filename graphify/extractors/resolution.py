@@ -13,6 +13,7 @@ from graphify.extractors.base import (  # noqa: F401
     _read_text,
 )
 from graphify.ids import normalize_id
+from graphify.input_snapshot import permits_source_path, read_source_text, snapshot_root
 from graphify.rcfile import effective_suffix, get_language_overrides
 import functools
 import hashlib
@@ -50,9 +51,12 @@ def _declared_language_suffixes(target_exts: tuple[str, ...]) -> tuple[str, ...]
     return tuple(sorted(suffixes))
 
 
-def _resolve_js_import_path(candidate: Path) -> Path:
+def _resolve_js_import_path(candidate: Path) -> Path | None:
     """Resolve a JS/TS/Svelte import target to a local file when it exists."""
     candidate = Path(os.path.normpath(candidate))
+    boundary = snapshot_root()
+    if boundary is not None and not candidate.absolute().is_relative_to(boundary):
+        return None
     try:
         if candidate.is_file():
             return candidate
@@ -132,11 +136,11 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
     Handles JSONC (comments + trailing commas) which is the default tsconfig format
     for SvelteKit, NestJS, Vite, T3, Astro, etc. (#700).
     """
-    if str(tsconfig) in seen:
+    if not permits_source_path(tsconfig) or str(tsconfig) in seen:
         return {}
     seen.add(str(tsconfig))
     try:
-        raw = tsconfig.read_text(encoding="utf-8")
+        raw = read_source_text(tsconfig, encoding="utf-8")
     except Exception as e:
         print(f"  warning: could not read {tsconfig} ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
         return {}
@@ -170,10 +174,10 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
         # Skip scoped npm package configs (e.g. @tsconfig/svelte) — not on disk.
         if not ext or ext.startswith("@"):
             continue
-        extended_path = _resolve_cached((base_dir / ext))
+        extended_path = _resolve_cached(base_dir / ext)
         if not extended_path.suffix:
             extended_path = extended_path.with_suffix(".json")
-        if extended_path.exists():
+        if permits_source_path(extended_path) and extended_path.exists():
             aliases.update(_read_tsconfig_aliases(extended_path, extended_path.parent, seen))
 
     # `references` — the solution-file / `tsc -b` layout (Vite, React, many
@@ -196,11 +200,14 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
             if not isinstance(ref_path, str) or not ref_path:
                 continue
             referenced = _resolve_cached(base_dir / ref_path)
+            boundary = snapshot_root()
+            if boundary is not None and not referenced.is_relative_to(boundary):
+                continue
             if referenced.is_dir():
                 referenced = referenced / "tsconfig.json"
             elif not referenced.suffix:
                 referenced = referenced.with_suffix(".json")
-            if referenced.exists():
+            if permits_source_path(referenced) and referenced.exists():
                 aliases.update(_read_tsconfig_aliases(referenced, referenced.parent, seen))
 
     # tsconfig `paths` are resolved relative to `baseUrl` (itself relative to
@@ -240,7 +247,7 @@ def _read_json_config(path: Path) -> "dict | None":
     baseUrl" instead of raising.
     """
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = read_source_text(path, encoding="utf-8", errors="replace")
     except OSError:
         return None
     for candidate in (raw, _strip_jsonc(raw)):
@@ -262,6 +269,8 @@ def _find_js_config(start_dir: Path) -> "tuple[Path, Path] | None":
     """
     current = _resolve_cached(start_dir)
     for candidate in [current, *current.parents]:
+        if not permits_source_path(candidate):
+            break
         for name in ("tsconfig.json", "jsconfig.json"):
             config = candidate / name
             if config.exists():
@@ -370,7 +379,7 @@ def _resolve_tsconfig_alias(raw: str, aliases: dict[str, list[str]],
             candidate = Path(os.path.normpath(base_url / raw))
             resolved = _resolve_js_import_path(candidate)
             try:
-                if resolved.is_file():
+                if resolved is not None and resolved.is_file():
                     return resolved
             except OSError:
                 pass
@@ -389,23 +398,25 @@ def _resolve_tsconfig_alias(raw: str, aliases: dict[str, list[str]],
                 cand = Path(os.path.normpath(cand / captured))
         resolved = _resolve_js_import_path(cand)
         try:
-            if resolved.is_file():
+            if resolved is not None and resolved.is_file():
                 return resolved
         except OSError:
             pass
-        if first is None:
+        if first is None and resolved is not None:
             first = cand
     return first
 
 def _find_workspace_root(start_dir: Path) -> Path | None:
     current = _resolve_cached(start_dir)
     for candidate in [current, *current.parents]:
+        if not permits_source_path(candidate):
+            break
         if (candidate / "pnpm-workspace.yaml").exists():
             return candidate
         package_json = candidate / "package.json"
         if package_json.is_file():
             try:
-                data = json.loads(package_json.read_text(encoding="utf-8"))
+                data = json.loads(read_source_text(package_json, encoding="utf-8"))
             except Exception:
                 continue
             if "workspaces" in data:
@@ -415,7 +426,7 @@ def _find_workspace_root(start_dir: Path) -> Path | None:
 def _pnpm_workspace_globs(workspace_file: Path) -> list[str]:
     globs: list[str] = []
     in_packages = False
-    for raw_line in workspace_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw_line in read_source_text(workspace_file, encoding="utf-8", errors="replace").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -447,7 +458,7 @@ def _workspace_globs(root: Path) -> list[str]:
 
     package_json = root / "package.json"
     try:
-        data = json.loads(package_json.read_text(encoding="utf-8"))
+        data = json.loads(read_source_text(package_json, encoding="utf-8"))
     except Exception:
         return []
 
@@ -475,6 +486,8 @@ def _load_workspace_packages(start_dir: Path) -> dict[str, Path]:
 
     packages: dict[str, Path] = {}
     for pattern in _workspace_globs(root):
+        if snapshot_root() is not None and (Path(pattern).is_absolute() or ".." in Path(pattern).parts):
+            continue
         try:
             package_dirs: list[Path] = [root] if pattern in (".", "./") else list(root.glob(pattern))
         except (ValueError, NotImplementedError) as e:
@@ -485,7 +498,7 @@ def _load_workspace_packages(start_dir: Path) -> dict[str, Path]:
             if not manifest.is_file():
                 continue
             try:
-                data = json.loads(manifest.read_text(encoding="utf-8"))
+                data = json.loads(read_source_text(manifest, encoding="utf-8"))
             except Exception:
                 continue
             name = data.get("name")
@@ -527,6 +540,9 @@ def _importer_platform(start_dir: Path) -> str | None:
     is not available at this point, so a platform-named segment is the signal.
     Returns None when nothing distinguishes the importer, which leaves every
     platform at the same priority afterwards."""
+    boundary = snapshot_root()
+    if boundary is not None:
+        start_dir = start_dir.relative_to(boundary)
     for part in reversed(start_dir.parts):
         segment = part.lower()
         for platform, hints in _PLATFORM_PATH_HINTS:
@@ -646,7 +662,7 @@ def _package_entry_candidates(
     manifest = package_dir / "package.json"
     manifest_data: dict[str, Any] = {}
     try:
-        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_data = json.loads(read_source_text(manifest, encoding="utf-8"))
     except Exception:
         pass
 
@@ -730,7 +746,7 @@ def _resolve_workspace_import(raw: str, start_dir: Path) -> Path | None:
         build_fallback: Path | None = None
         for candidate in _package_entry_candidates(package_dir, subpath, platform):
             resolved = _resolve_js_import_path(candidate)
-            if resolved.is_file():
+            if resolved is not None and resolved.is_file():
                 if _is_build_output_path(resolved, package_dir):
                     if build_fallback is None:
                         build_fallback = resolved
@@ -754,11 +770,15 @@ def _find_js_project_anchor(start_dir: Path) -> Path:
     home = Path.home()
 
     for candidate in [current, *current.parents]:
+        if not permits_source_path(candidate):
+            break
         if candidate == home:
             break
         if (candidate / "package.json").is_file() or (candidate / "pnpm-workspace.yaml").is_file():
             return candidate
 
+    if snapshot_root() is not None:
+        return snapshot_root()
     vcs_root = _find_vcs_root(start_dir)
     if vcs_root is not None:
         return vcs_root
@@ -787,6 +807,8 @@ def _load_package_imports(start_dir: Path) -> "tuple[Path, dict] | None":
         return _PACKAGE_IMPORTS_CACHE[key]
     result: "tuple[Path, dict] | None" = None
     for candidate in [current, *current.parents]:
+        if not permits_source_path(candidate):
+            break
         manifest = candidate / "package.json"
         if manifest.is_file():
             data = _read_json_config(manifest)
@@ -852,7 +874,7 @@ def _resolve_package_import(raw: str, start_dir: Path) -> "Path | None":
         target = target.replace("*", captured, 1) if captured else target
     candidate = Path(os.path.normpath(package_dir / target))
     resolved = _resolve_js_import_path(candidate)
-    return resolved if resolved.is_file() else None
+    return resolved if resolved is not None and resolved.is_file() else None
 
 def _resolve_js_module_path(raw: str | Path, start_dir: Path | None = None) -> Path | None:
     """Resolve a JS/TS module path or specifier to a local source file.
@@ -896,10 +918,10 @@ def _resolve_js_module_path(raw: str | Path, start_dir: Path | None = None) -> P
             anchor = _find_js_project_anchor(start_dir)
             if (anchor / "src").is_dir():
                 cand = _resolve_js_import_path(anchor / "src" / subpath)
-                if cand.is_file():
+                if cand is not None and cand.is_file():
                     return cand
             cand = _resolve_js_import_path(anchor / subpath)
-            if cand.is_file():
+            if cand is not None and cand.is_file():
                 return cand
 
     return None
@@ -913,7 +935,12 @@ def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | Non
     """
     if not raw:
         return None
-    resolved_path = _resolve_js_module_path(raw, Path(str_path).parent)
+    try:
+        resolved_path = _resolve_js_module_path(raw, Path(str_path).parent)
+    except PermissionError:
+        return None
+    if resolved_path is not None and not permits_source_path(resolved_path):
+        return None
     if resolved_path is not None:
         return _make_id(str(resolved_path)), resolved_path
     module_name = raw.split("/")[-1]
@@ -1255,6 +1282,10 @@ def _resolve_cached(path: "Path | str") -> Path:
     ``Path.resolve()`` — callers keep their own try/except — and an
     exception is never cached.
     """
+    if snapshot_root() is not None:
+        # The worker already rejected aliases. Lexical resolution avoids even
+        # probing out-of-root/UNC targets named by untrusted configuration.
+        return Path(os.path.abspath(path))
     path_str = str(path)
     return _cached_realpath(path_str, _memo_cwd(path_str))
 

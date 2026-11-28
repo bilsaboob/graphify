@@ -859,12 +859,15 @@ def _reconcile_markdown_links(
         canonical_id = _file_node_id(Path(source_file))
         canonical = [node for node in nodes if node["id"] == canonical_id]
         pages = [node for node in nodes if node.get("node_kind") == "page"]
+        structural_pages = [node for node in pages if _is_ast_tier(node)]
         semantic_documents = [
             node
             for node in nodes
             if node.get("file_type") == "document" and node.get("_origin") != "ast"
         ]
-        if len(canonical) == 1:
+        if len(structural_pages) == 1:
+            representatives[source_file] = structural_pages[0]["id"]
+        elif len(canonical) == 1:
             representatives[source_file] = canonical[0]["id"]
         elif len(pages) == 1:
             representatives[source_file] = pages[0]["id"]
@@ -1408,6 +1411,7 @@ def _reconcile_existing_graph(
         # move the new AST node to a stable source-qualified ID and retarget
         # *fresh AST* edges/hyperedges, never the preserved semantic edges.
         from graphify.build import _has_independent_semantic_evidence
+        from graphify.dedup import _defines_id
         from hashlib import sha256
         old_nodes_by_id = {
             n["id"]: n for n in existing.get("nodes", [])
@@ -1420,7 +1424,14 @@ def _reconcile_existing_graph(
             if (
                 not isinstance(nid, str) or not old
                 or _is_ast_tier(old)
-                or not _has_independent_semantic_evidence(old)
+                or (Path(str(old.get("source_file") or "")).suffix.lower() == ".md"
+                    and _defines_id(fresh)
+                    and (fresh.get("file_type") == "code"
+                         or Path(str(fresh.get("source_file") or "")).suffix.lower() != ".md"))
+                or not (_has_independent_semantic_evidence(old) or (
+                    old.get("_origin") == "semantic"
+                    and Path(str(old.get("source_file") or "")).suffix.lower() == ".md"
+                ))
                 or source_paths.is_evicted(old, node_evicted_source_identities)
             ):
                 continue
@@ -1464,12 +1475,8 @@ def _reconcile_existing_graph(
                 f"{len(collisions)} independent semantic node(s) from AST ID collision"
             )
 
-        # A full re-extraction owns the AST nodes of every source it actually
-        # re-extracted (extract_targets, via rebuilt_source_identities) — NOT
-        # every AST node under watch_root: a semantic-backed doc is excluded
-        # from extract_targets (#1915), so its existing AST layer is not
-        # regenerated this run and dropping it would be data loss (#2333,
-        # COEXIST — the AST and semantic layers of a file coexist).
+        # Re-extraction owns only successfully rebuilt AST sources, including
+        # Markdown structure. Its independent semantic layer remains preserved.
         # Incremental extraction owns only nodes from rebuilt or deleted
         # sources. Semantic-tier nodes (per _is_ast_tier) remain preserved.
         # Nodes explicitly classified as fail-closed preserved (#3695) must
@@ -2111,7 +2118,7 @@ _FRAMEWORK_STATE_NAME = ".graphify_framework_state.json"
 def _framework_refresh_paths(out: Path, paths: list[Path], root: Path, *, configuration_root: Path | None = None) -> tuple[str | None, list[Path]]:
     """Invalidate deterministic analysis without widening the document/LLM pass."""
     import hashlib
-    from graphify.framework_analysis import SUPPORTED_SUFFIXES, analysis_fingerprint, options_for_root
+    from graphify.native_annotations import SUPPORTED_SUFFIXES, analysis_fingerprint, options_for_root
     from graphify.build import _norm_source_file
 
     selected = [path for path in paths if effective_suffix(path) in SUPPORTED_SUFFIXES]
@@ -2139,16 +2146,8 @@ def _framework_refresh_paths(out: Path, paths: list[Path], root: Path, *, config
 
 
 def _framework_complete(data: dict) -> bool:
-    from graphify.framework_pipeline import evidence_from_data
-    store = evidence_from_data(data)
-    return all(
-        not entry.get("refreshFailed")
-        and entry["result"]["state"] in {"complete", "not-applicable"}
-        and not entry["result"]["diagnostics"]
-        and all(report["state"] in {"complete", "not-applicable"} and not report["diagnostics"]
-                for report in entry["result"]["reports"])
-        for entry in (store or {}).get("documents", {}).values()
-    )
+    from graphify.framework_pipeline import evidence_from_data, evidence_is_complete
+    return evidence_is_complete(evidence_from_data(data))
 
 
 def _stamp_framework_state(out: Path, fingerprint: str | None, *, complete: bool) -> None:
@@ -2795,69 +2794,8 @@ def _rebuild_code(
             return False
         existing_snapshot = metadata.get("data", {})
 
-        # #1915: a document that already carries SEMANTIC (LLM) nodes in the
-        # existing graph must not ALSO be AST-quick-scanned — otherwise every
-        # rebuild mints heading nodes on top of the preserved semantic nodes
-        # and the doc is represented twice (~4x graph bloat vs the CLI update
-        # path, which AST-extracts only code). A semantic-backed doc is never
-        # re-quick-scanned, and any AST layer it already carries coexists and
-        # is preserved rather than regenerated (#2333, COEXIST); the
-        # quick-scan stays as a fallback for docs with no semantic layer (the
-        # no-LLM doc-structure feature, #09b33b7) and for brand-new docs the
-        # graph has never seen. These docs stay in ``code_files`` so
-        # corpus membership (#1795 fail-closed deletion evidence) and the
-        # shrink accounting below still cover them — a previously-bloated
-        # graph must be allowed to self-heal on a full rebuild without the
-        # shrink-guard refusing the smaller write.
-        semantic_doc_files: set[Path] = set()
-        if ast_doc_files and existing_graph.exists():
-            try:
-                prior = existing_snapshot
-                prior_paths = _StoredSourcePaths(
-                    prior,
-                    out=out,
-                    project_root=project_root,
-                    watch_root=watch_root,
-                    normalize_source=_nsf,
-                )
-                # Semantic doc nodes lack the AST origin marker. Gate on the
-                # doc-shaped subset of the six-value file_type enum
-                # (document/concept/rationale/paper AND code) rather than
-                # "document" alone: per the extraction spec, a doc full of named
-                # concepts may be represented with ONLY concept/rationale
-                # nodes and no separate "document" node — that's still
-                # evidence of a semantic layer, not a marker-less AST node
-                # (#1954). "code" is included too (#2014): the semantic pass
-                # legitimately mints code-typed nodes for symbols surfaced from
-                # WITHIN a doc (llm.py `_bind_node_evidence`), and it cannot be
-                # confused with a pre-#1865 marker-less AST code node — those are
-                # sourced from code files, which never intersect ast_doc_files
-                # below, whereas the AST quick-scan of a doc only ever mints
-                # "document" nodes (extractors/markdown.py). "image" stays out.
-                semantic_doc_identities: set[str] = set()
-                for node in prior.get("nodes", []):
-                    # _is_ast_tier, not a raw _origin check (#2334): a legacy
-                    # unstamped AST heading node (source_location "L<n>") must
-                    # not fake a semantic layer, or the doc would be excluded
-                    # from the AST quick-scan forever.
-                    if _is_ast_tier(node):
-                        continue
-                    if node.get("file_type") not in (
-                        "document", "concept", "rationale", "paper", "code"
-                    ):
-                        continue
-                    identity = prior_paths.identity(node.get("source_file"))
-                    if identity:
-                        semantic_doc_identities.add(identity)
-                if semantic_doc_identities:
-                    semantic_doc_files = {
-                        p for p in ast_doc_files
-                        if prior_paths.absolute_identity(str(p), project_root)
-                        in semantic_doc_identities
-                    }
-            except Exception:
-                semantic_doc_files = set()
-
+        # Markdown structure is refreshed independently of its preserved LLM
+        # layer, so changed headings/examples do not retain stale source spans.
         # Incremental path: when the caller passed an explicit change list,
         # extract only changed-and-still-existing files. Deleted paths are
         # tracked separately so their stale nodes can be evicted below.
@@ -2870,12 +2808,6 @@ def _rebuild_code(
 
         if changed_paths is not None:
             code_set = {Path(os.path.abspath(p)) for p in code_files}
-            # #1915: semantic-backed docs are never AST-quick-scanned; their
-            # semantic nodes are the sole representation. Mirroring #1865's
-            # tier-scoped edge rule at the node level, they also must NOT
-            # enter extract_targets (hence rebuilt/node-evicted identities) on
-            # an incremental rebuild, or their semantic nodes would be wiped.
-            semantic_doc_set = {Path(os.path.abspath(p)) for p in semantic_doc_files}
             wanted: list[Path] = []
             ignore_rules_changed = False
             change_root = Path.cwd().resolve()
@@ -2893,7 +2825,7 @@ def _rebuild_code(
                     ignore_rules_changed = True
                 tracked = next((cand for cand in candidates if cand.exists() and cand in code_set), None)
                 if tracked is not None:
-                    if tracked not in wanted and tracked not in semantic_doc_set:
+                    if tracked not in wanted:
                         wanted.append(tracked)
                     continue
 
@@ -2931,20 +2863,14 @@ def _rebuild_code(
             # Ignore changes can introduce sources absent from the prior graph.
             # Cached extraction still avoids reparsing unchanged ASTs.
             if ignore_rules_changed:
-                wanted = [p for p in code_files if p not in semantic_doc_files]
+                wanted = list(code_files)
             # With an existing graph, an empty batch can still have stale sources
             # (for example a destination-only rename to an unsupported suffix).
             if not wanted and not deleted_paths and not existing_graph.exists():
                 return True
             extract_targets = wanted
         else:
-            # Full rebuild: skip the AST quick-scan for semantic-backed docs
-            # (#1915). They remain in code_files for corpus membership and
-            # shrink accounting, but because they are not extract targets the
-            # full-rebuild AST ownership rule (scoped to
-            # rebuilt_source_identities, #2333 COEXIST) leaves their existing
-            # AST heading layer intact alongside the semantic layer.
-            extract_targets = [p for p in code_files if p not in semantic_doc_files]
+            extract_targets = list(code_files)
 
         # #2406: an incremental rebuild parses only the changed files, so the
         # cross-file resolvers could not see a callee living in an unchanged
@@ -3269,6 +3195,14 @@ def _rebuild_code(
         }
         out.mkdir(exist_ok=True)
 
+        from graphify.markdown_resolution import DOCUMENTATION_EDGE_PRODUCER
+        result["edges"] = [e for e in result.get("edges", [])
+                           if e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
+        if any(p.suffix.lower() == ".md" for p in extract_targets) and any(
+            Path(str(n.get("source_file") or "")).suffix.lower() == ".md" and not _is_ast_tier(n)
+            for n in existing_snapshot.get("nodes", [])
+        ):
+            print("[graphify watch] Refreshed Markdown structure; existing semantic documentation was preserved, not re-extracted.")
         if no_cluster:
             # Normalise to "links" key so schema is consistent with the full clustered path.
             # Dedupe parallel edges (the clustered path's DiGraph collapses them implicitly);
@@ -3311,7 +3245,7 @@ def _rebuild_code(
             # endpoint in graph.json that every loader materialises as an
             # attribute-less phantom (#2873). Any other edge without two declared
             # endpoints is dropped, as build_from_json drops it.
-            _finalize_raw_graph_endpoints(candidate_graph_data)
+            _finalize_raw_graph_endpoints(candidate_graph_data, root=project_root)
             from graphify.framework_pipeline import pack_raw_evidence
             pack_raw_evidence(candidate_graph_data)
             candidate_graph_text = _json_text(candidate_graph_data)
@@ -3741,15 +3675,16 @@ def _has_non_code(changed_paths: list[Path]) -> bool:
 def _batch_triggers_rebuild(batch: list[Path]) -> bool:
     """True when a debounced watch batch needs an immediate rebuild.
 
-    Code changes always rebuild (AST extraction needs no LLM). Deletions of
+    Code and Markdown changes rebuild their structure without an LLM. Deletions of
     ANY watched file also rebuild: eviction needs no LLM either — the full
     corpus reconcile drops nodes whose source is gone from disk. Without
     this, a doc-only deletion batch would sit behind the needs_update flag
     until the next code event or a manual `graphify update` (#2580).
     """
     has_code = any(effective_suffix(p).lower() in _CODE_EXTENSIONS for p in batch)
+    has_markdown = any(p.suffix.lower() == ".md" for p in batch)
     has_deletion = any(not p.exists() for p in batch)
-    return has_code or has_deletion
+    return has_code or has_markdown or has_deletion
 
 
 def _watch_event_filter():

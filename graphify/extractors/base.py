@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import sys
+import hashlib
+import os
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -37,6 +40,23 @@ from graphify.paths import take_preread_bytes as _take_preread_bytes
 _ACTIVE_SCAN_ROOT: "ContextVar[Path | None]" = ContextVar(
     "_ACTIVE_SCAN_ROOT", default=None
 )
+_SOURCE_CAPTURE: ContextVar[dict | None] = ContextVar("_SOURCE_CAPTURE", default=None)
+
+
+@contextmanager
+def source_capture(path: Path):
+    """One per-file snapshot shared by structural and annotation consumers."""
+    capture = {"path": os.path.abspath(path)}
+    token = _SOURCE_CAPTURE.set(capture)
+    try:
+        yield capture
+    finally:
+        _SOURCE_CAPTURE.reset(token)
+
+
+def captured_source(path: Path) -> dict | None:
+    capture = _SOURCE_CAPTURE.get()
+    return capture if capture is not None and capture["path"] == os.path.abspath(path) else None
 
 
 def set_active_scan_root(root: "Path | None") -> "Path | None":
@@ -156,7 +176,7 @@ _SOURCE_FALLBACK_ENCODINGS = ("cp1252", "latin-1")
 _warned_source_encodings: set[str] = set()
 
 
-def _read_source_bytes(path: Path, *, warn: bool = True) -> bytes:
+def _read_utf8_source_bytes(path: Path, *, warn: bool = True) -> bytes:
     """Read a source file as the UTF-8 bytes tree-sitter parses.
 
     tree-sitter treats its input as UTF-8. Raw bytes in another encoding were
@@ -176,20 +196,36 @@ def _read_source_bytes(path: Path, *, warn: bool = True) -> bytes:
     # current context holds them for this path, so a cold build reads the file
     # once instead of twice (#perf). Falls back to a disk read for any path the
     # key hash did not read (warm stat fastpath, direct extractor calls, tests).
-    raw = _take_preread_bytes(path)
+    capture = captured_source(path)
+    if capture is not None and "utf8" in capture:
+        return capture["utf8"]
+    from graphify.input_snapshot import source_bytes
+    raw = source_bytes(path)
+    if raw is None:
+        raw = _take_preread_bytes(path)
     if raw is None:
         raw = path.read_bytes()
+    if capture is not None:
+        capture["original_hash"] = hashlib.sha256(raw).hexdigest()
+        capture["exact_utf8"] = True
+
+    def retain(data: bytes) -> bytes:
+        if capture is not None:
+            capture["utf8"] = data
+            capture["exact_utf8"] = data == raw
+        return data
+
     if raw.isascii():
-        return raw
+        return retain(raw)
     try:
         raw.decode("utf-8")
-        return raw
+        return retain(raw)
     except UnicodeDecodeError:
         pass
     for boms, encoding in ((_UTF32_BOMS, "utf-32"), (_UTF16_BOMS, "utf-16")):
         if raw.startswith(boms):
             try:
-                return raw.decode(encoding).encode("utf-8")
+                return retain(raw.decode(encoding).encode("utf-8"))
             except UnicodeDecodeError:
                 continue  # FF FE 00 00 is also UTF-16-LE: BOM + U+0000
     for encoding in _SOURCE_FALLBACK_ENCODINGS:
@@ -205,14 +241,40 @@ def _read_source_bytes(path: Path, *, warn: bool = True) -> bytes:
                 "Re-save it as UTF-8 if names in the graph look wrong.",
                 file=sys.stderr,
             )
-        return text.encode("utf-8")
-    return raw  # unreachable: latin-1 decodes every byte
+        return retain(text.encode("utf-8"))
+    return retain(raw)  # unreachable: latin-1 decodes every byte
+
+
+def _read_source_bytes(path: Path, *, warn: bool = True) -> bytes:
+    """Read normalized source, masking qualified TS credential spans in memory."""
+    from graphify.rcfile import effective_suffix
+
+    path = Path(path)
+    capture = captured_source(path)
+    if capture is not None and "source" in capture:
+        return capture["source"]
+    source = _read_utf8_source_bytes(path, warn=warn)
+    suffix = effective_suffix(path)
+    if suffix in {".ts", ".tsx", ".mts", ".cts"}:
+        from graphify.security import redact_secrets, redact_source_credentials
+        try:
+            safe, redaction = redact_source_credentials(
+                source.decode("utf-8"), "tsx" if suffix == ".tsx" else "typescript"
+            )
+        except ValueError as exc:
+            raise ValueError(f"Cannot safely redact source {redact_secrets(str(path))}: {exc}") from exc
+        source = safe.encode("utf-8")
+        if capture is not None:
+            capture["redaction"] = redaction
+    if capture is not None:
+        capture["source"] = source
+    return source
 
 
 def _read_source_text(path: Path, *, warn: bool = True) -> str:
     """``_read_source_bytes`` as text, for extractors that work on ``str``.
 
-    Matches ``path.read_text(encoding="utf-8")`` exactly for every valid UTF-8
+    Apart from qualified credential masks, matches text for every valid UTF-8
     file, including its universal-newline translation (``\\r\\n`` and a lone
     ``\\r`` both become ``\\n``) and a kept BOM, so regex extractors see the same
     text they always did.

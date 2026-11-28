@@ -164,14 +164,15 @@ def test_parser_version_is_installed_and_qualified(monkeypatch):
         analysis.parser_descriptor()
 
 
-def test_secret_snapshot_refusal_does_not_restrict_raw_parser_or_echo_secret(monkeypatch):
+def test_secret_snapshot_is_redacted_but_forged_raw_dispatch_is_refused(monkeypatch):
     secret = "ghp_" + "A" * 36
     source = f'const token="{secret}";'
     assert redact_secrets(source) != source
     tree = analysis.serialize_tree(source)
-    with pytest.raises(analysis.FrameworkAnalysisError) as error:
-        analysis.make_document(source, "credential.ts")
-    assert secret not in str(error.value)
+    document = analysis.make_document(source, "credential.ts")
+    assert secret not in json.dumps(document)
+    assert document["redaction"]["originalSourceHash"] == hashlib.sha256(source.encode()).hexdigest()
+    assert document["sourceHash"] != document["redaction"]["originalSourceHash"]
     invoked = []
     monkeypatch.setattr(analysis, "_run_worker", lambda *args, **kwargs: invoked.append(args))
     forged = {
@@ -184,6 +185,17 @@ def test_secret_snapshot_refusal_does_not_restrict_raw_parser_or_echo_secret(mon
     with pytest.raises(analysis.FrameworkAnalysisError, match="credential-shaped"):
         analysis.analyze_documents([forged])
     assert not invoked
+
+
+def test_secret_snapshot_diagnostic_locates_line_and_redacts_sensitive_path():
+    secret = "ghp_" + "B" * 36
+    source = f'// context\r\nconst label = "safe";\r\nconst token = "{secret}";\r\n'
+    with pytest.raises(analysis.FrameworkAnalysisError) as error:
+        analysis.make_document(source, f"fixtures/{secret}.ts")
+    message = str(error.value)
+    assert "fixtures/[redacted].ts" in message
+    assert secret not in message
+    assert "const token" not in message
 
 
 def test_real_worker_exact_unicode_source_never_executes_application(tmp_path):
@@ -615,8 +627,9 @@ def test_fingerprint_binds_python_bridge_bundle_and_parser_bytes(tmp_path, monke
     bridge, worker = tmp_path / "framework_analysis.py", tmp_path / "worker.mjs"
     bridge.write_bytes(b"bridge-version-one")
     worker.write_bytes(b"bundle-version-one")
-    dependencies = ["extract.py", "build.py", "framework_pipeline.py", "watch.py"]
+    dependencies = ["extract.py", "build.py", "framework_pipeline.py", "watch.py", "security.py", "extractors/base.py"]
     for name in dependencies:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_bytes(b"pipeline-version-one")
     monkeypatch.setattr(analysis, "__file__", str(bridge))
     monkeypatch.setattr(analysis, "_worker_path", lambda: worker)
@@ -828,10 +841,11 @@ def test_root_options_use_authoritative_defaults_and_no_implicit_ancestors(tmp_p
     (parent / ".graphifyrc").write_text(
         'semantic_module_aliases={"@parent/ui":"solid-js"}\n', encoding="utf-8"
     )
-    expected = normalize_analysis_options({}, max_limits=ANNOTATION_LIMITS)
+    reference_limits = {**ANNOTATION_LIMITS, "maxPlugins": 8}
+    expected = normalize_analysis_options({}, max_limits=reference_limits)
     assert analysis.options_for_root(root) == expected
     assert expected["moduleAliases"] == {}
-    assert expected["limits"] == ANNOTATION_LIMITS
+    assert expected["limits"] == reference_limits
     assert (
         analysis.analysis_fingerprint(options=analysis.options_for_root(root))
         == analysis.analysis_fingerprint()

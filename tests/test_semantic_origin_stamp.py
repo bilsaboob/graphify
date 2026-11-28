@@ -251,7 +251,7 @@ def test_semantic_alias_keeps_authored_ast_links_and_document_provenance(tmp_pat
     from graphify.watch import _rebuild_code
 
     (tmp_path / "sample.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
-    (tmp_path / "design.md").write_text("# Design\nA stable protocol.\n", encoding="utf-8")
+    (tmp_path / "design.md").write_text("# Design\nA stable protocol. See [code](sample.py).\n", encoding="utf-8")
     out = tmp_path / "graphify-out"
     out.mkdir()
     graph = out / "graph.json"

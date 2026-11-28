@@ -3905,18 +3905,15 @@ def test_markdown_finds_nested_heading():
     labels = _labels(r)
     assert any("Database Migration" in l for l in labels)
 
-def test_markdown_skips_fenced_code_blocks():
-    """Fenced code blocks should NOT emit nodes (#1077).
-
-    They were always orphans (single contains edge to parent doc) and
-    inflated the disconnected-component count. We still skip over their
-    *contents* when parsing so the inside of a fence is not misread as a
-    heading.
-    """
+def test_markdown_retains_fenced_examples_as_documentation():
+    """Examples are searchable document records, not production code nodes."""
     r = extract_markdown(FIXTURES / "deploy_guide.md")
-    labels = _labels(r)
-    assert not any(l.startswith("code:") for l in labels), \
-        f"Expected no code:* nodes after #1077 fix, got: {[l for l in labels if l.startswith('code:')]}"
+    examples = [n for n in r["nodes"] if n.get("node_kind") == "code_example"]
+    assert examples
+    assert all(n["file_type"] == "document" for n in examples)
+    assert all(any(e["target"] == n["id"] and e["relation"] == "contains"
+                   for e in r["edges"]) for n in examples)
+    assert not any(e["relation"] == "calls" for e in r["edges"])
 
 def test_markdown_contains_edges():
     """Headings should be connected via 'contains' edges (file->h, h->h)."""

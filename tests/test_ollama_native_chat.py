@@ -86,6 +86,7 @@ def test_ollama_uses_native_chat_with_num_ctx(monkeypatch):
     assert path == "http://localhost:11434/api/chat"
     assert body["model"] == "qwen2.5:14b"
     assert body["stream"] is False
+    assert body["format"] == "json"
     assert [m["role"] for m in body["messages"]] == ["system", "user"]
     assert body["messages"][1]["content"].endswith("x" * 100)
     # 40k chars is ~10k tokens; num_ctx must cover it plus the output cap.
@@ -144,6 +145,7 @@ def test_server_without_native_chat_falls_back_to_v1_once(monkeypatch, capsys):
 
     assert len(calls["post"]) == 1, "a /v1-only server must not be probed on every chunk"
     assert len(calls["create"]) == 2
+    assert all(c["response_format"] == {"type": "json_object"} for c in calls["create"])
     assert first["nodes"] == [{"id": "v1"}]
     assert second["input_tokens"] == 4096
     assert "falling back" in capsys.readouterr().err
@@ -178,6 +180,7 @@ def test_explicit_extra_body_keeps_v1(monkeypatch):
 
     assert calls["post"] == []
     assert calls["create"][0]["extra_body"] == {"options": {"num_ctx": 4096}}
+    assert "response_format" not in calls["create"][0]
 
 
 def test_other_backends_never_use_native_chat(monkeypatch):
@@ -206,6 +209,7 @@ def test_call_llm_ollama_uses_native_chat(monkeypatch):
     path, body = calls["post"][0]
     assert path.endswith("/api/chat")
     assert [m["role"] for m in body["messages"]] == ["user"]
+    assert "format" not in body, "plain-text labels must not inherit extraction JSON mode"
     assert body["options"]["num_ctx"] > 10_000
     assert body["options"]["num_predict"] == 1024
     assert usage == {"input": 6316, "output": 901}

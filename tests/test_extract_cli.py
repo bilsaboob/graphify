@@ -227,7 +227,7 @@ def test_extract_allow_partial_continues_past_ast_failure(
     )
 
 
-def test_extract_exits_nonzero_when_all_semantic_chunks_fail(
+def test_extract_keeps_structure_when_all_semantic_chunks_fail(
     monkeypatch, tmp_path, capsys
 ):
     """When every semantic chunk errors (e.g. backend SDK not installed),
@@ -269,23 +269,20 @@ def test_extract_exits_nonzero_when_all_semantic_chunks_fail(
          "--out", str(out_dir)],
     )
 
-    with pytest.raises(SystemExit) as exc_info:
+    try:
         mainmod.main()
-
-    assert exc_info.value.code == 1, (
-        f"expected exit code 1 when all semantic chunks fail, "
-        f"got {exc_info.value.code}"
-    )
+    except SystemExit as exc:
+        assert exc.code == 0
 
     stderr = capsys.readouterr().err
     assert "all semantic chunks failed" in stderr
     assert "claude" in stderr
 
-    # No graph.json should have been written - the failure must abort before
-    # the merge/cluster/write phase, not after.
-    assert not (out_dir / "graphify-out" / "graph.json").exists(), (
-        "graph.json must not be written when semantic extraction fails"
-    )
+    # Useful source structure survives; semantic coverage must remain pending.
+    import json
+    graph = json.loads((out_dir / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    assert any(n.get("node_kind") == "heading" for n in graph["nodes"])
+    assert any(n.get("attributes", {}).get("semantic_coverage") == "partial" for n in graph["nodes"])
 
 
 def test_extract_succeeds_when_at_least_one_chunk_completes(

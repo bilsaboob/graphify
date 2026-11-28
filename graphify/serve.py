@@ -14,7 +14,7 @@ from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.paths import consumed, read_graph_json
-from graphify.security import sanitize_label, check_graph_file_size_cap, _CONTROL_CHAR_RE
+from graphify.security import sanitize_label, redact_secrets, check_graph_file_size_cap, _CONTROL_CHAR_RE
 from graphify.build import _CONFIDENCE_RANK, edge_datas, edge_evidence, has_parallel_links
 from graphify.paths import default_graph_json as _default_graph_json, _is_test_path
 
@@ -90,6 +90,8 @@ def _read_graph(graph_path: str) -> nx.Graph:
     )
     if semantic_evidence is not None:
         G.graph["semantic_evidence"] = semantic_evidence
+        from graphify.framework_evidence import _remember_evidence
+        _remember_evidence(G, semantic_evidence)
     G.graph["_logical_directed"] = _logical_directed
     # node_link_graph drops top-level keys other than data["graph"], so the
     # build commit export.to_json writes there is stashed by hand (#3354).
@@ -1369,6 +1371,71 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
+def _node_attribute_items(data: dict) -> list[tuple]:
+    """Display-only ordering/cleaning; never clip the stored attributes."""
+    attrs = data.get("attributes")
+    if not isinstance(attrs, dict):
+        return []
+
+    def clean(value):
+        if isinstance(value, str):
+            return redact_secrets(_CONTROL_CHAR_RE.sub("", value))
+        if isinstance(value, dict):
+            return {clean(k): clean(v) for k, v in sorted(value.items())}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        return value
+
+    priority = ()
+    if data.get("file_type") in ("document", "paper") or data.get("node_kind") in (
+        "doc_concept", "doc_mention", "code_example",
+    ):
+        priority = ("summary", "preview", "aliases", "section", "code_resolution", "language")
+        if data.get("node_kind") == "code_example":
+            priority = ("preview", "language", "section", "code_resolution", "summary", "aliases")
+    order = {key: i for i, key in enumerate(priority)}
+    return [(clean(k), clean(v)) for k, v in sorted(
+        attrs.items(), key=lambda item: (order.get(item[0], len(order)), item[0]),
+    )]
+
+
+def _node_attributes_json(data: dict) -> str:
+    """The bounded Attributes value shared by get_node and CLI explain."""
+    items = _node_attribute_items(data)
+    if not items:
+        return ""
+    text = json.dumps(dict(items))
+    return text[:997] + "..." if len(text) > 1000 else text
+
+
+def _edge_display_suffix(
+    edge: dict, target: dict, *, neighbor: dict | None = None,
+    include_context: bool = True,
+) -> str:
+    """Bounded advisory details, separate from the original reference-site suffix.
+
+    ``target`` is the actual indexed edge target; incoming relationship lines
+    also pass ``neighbor`` so the displayed source label has its own locator.
+    No graph-wide lookup is needed, including for repeated target labels.
+    """
+    def clean(value, limit=256):
+        text = redact_secrets(_CONTROL_CHAR_RE.sub("", str(value or "")))
+        return text[:limit - 3] + "..." if len(text) > limit else text
+
+    suffix = ""
+    if include_context and edge.get("context"):
+        suffix += f" context={clean(edge['context'])}"
+    if edge.get("_generated_by") != "markdown-advisory-v1" and not edge.get("match_reason"):
+        return suffix
+    if edge.get("match_reason"):
+        suffix += " match_reason=" + json.dumps(clean(edge["match_reason"], 120), ensure_ascii=False)
+    for key, node in (("target", target), ("neighbor", neighbor)):
+        if node is not None and (node.get("source_file") or node.get("source_location")):
+            locator = f"{node.get('source_file') or ''}:{node.get('source_location') or ''}"
+            suffix += f" {key}=" + json.dumps(clean(locator), ensure_ascii=False)
+    return suffix
+
+
 def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None, scores: dict[str, float] | None = None) -> str:
     """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
 
@@ -1452,15 +1519,16 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
             status = sanitize_label(str(entry.get("status", "")))
             if status:
                 learning_suffix = f" learning={status}{':stale' if entry.get('stale') else ''}"
-        attrs = d.get("attributes")
+        attrs = _node_attribute_items(d)
+        redaction_suffix = " source-view=redacted" if d.get("source_redaction") else ""
         attrs_suffix = ""
-        if isinstance(attrs, dict) and attrs:
+        if attrs:
             pairs = []
-            for k, v in sorted(attrs.items()):
+            for k, v in attrs:
                 if isinstance(v, (dict, list)):
                     v_str = json.dumps(v, sort_keys=True)
                 elif isinstance(v, str):
-                    v_str = f'"{v}"'
+                    v_str = json.dumps(v, ensure_ascii=False)
                 elif isinstance(v, bool):
                     v_str = "true" if v else "false"
                 elif v is None:
@@ -1478,11 +1546,12 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
                 attrs_summary = attrs_summary[:197] + "..."
             attrs_suffix = f" attrs={{{sanitize_label(attrs_summary)}}}"
         line = (
-            f"NODE {sanitize_label(d.get('label', nid))} "
-            f"[src={sanitize_label(str(d.get('source_file', '')))} "
-            f"loc={sanitize_label(str(d.get('source_location', '')))} "
+            f"NODE {sanitize_label(redact_secrets(d.get('label', nid)))} "
+            f"[src={sanitize_label(redact_secrets(str(d.get('source_file', ''))))} "
+            f"loc={sanitize_label(redact_secrets(str(d.get('source_location', ''))))} "
             f"community={sanitize_label(str(d.get('community_name') or d.get('community', '')))}"
             f"{learning_suffix}"
+            f"{redaction_suffix}"
             f"{attrs_suffix}]"
         )
         lines.append(line)
@@ -1508,20 +1577,21 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
                 if {src, tgt} != {u, v}:
                     src, tgt = u, v
                 context = d.get("context")
-                context_suffix = f" context={sanitize_label(str(context))}" if context else ""
+                context_suffix = f" context={sanitize_label(redact_secrets(str(context)))}" if context else ""
                 # The relation SITE (call/import/reference line in the source's
                 # file), not a def line — so "who calls X" cites a clickable call
                 # location, not the caller's def (#BUG1).
                 _loc = str(d.get("source_location") or "")
                 at_suffix = (
-                    f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(_loc)}"
+                    f" at={sanitize_label(redact_secrets(str(d.get('source_file') or '')))}:{sanitize_label(redact_secrets(_loc))}"
                     if _loc else ""
                 )
                 line = (
-                    f"EDGE {sanitize_label(G.nodes[src].get('label', src))} "
+                    f"EDGE {sanitize_label(redact_secrets(G.nodes[src].get('label', src)))} "
                     f"--{sanitize_label(str(d.get('relation', '')))} "
                     f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
-                    f"{sanitize_label(G.nodes[tgt].get('label', tgt))}{at_suffix}"
+                    f"{sanitize_label(redact_secrets(G.nodes[tgt].get('label', tgt)))}{at_suffix}"
+                    f"{_edge_display_suffix(d, G.nodes[tgt], include_context=False)}"
                 )
                 lines.append(line)
     output = "\n".join(lines)
@@ -2892,7 +2962,7 @@ def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
         # node's file, not a def line (#BUG1).
         loc = str(d.get("source_location") or "")
         return (
-            f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
+            f" at={sanitize_label(redact_secrets(str(d.get('source_file') or '')))}:{sanitize_label(redact_secrets(loc))}"
             if loc else ""
         )
     lines: list[str] = []
@@ -2902,8 +2972,9 @@ def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  --> {sanitize_label(redact_secrets(G.nodes[nb].get('label', nb)))} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(_confidence_tag(d))}]{_edge_at(d)}"
+                f"{_edge_display_suffix(d, G.nodes[nb])}"
             )
     for nb in G.predecessors(nid):
         for d in edge_datas(G, nb, nid):
@@ -2911,8 +2982,9 @@ def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  <-- {sanitize_label(redact_secrets(G.nodes[nb].get('label', nb)))} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(_confidence_tag(d))}]{_edge_at(d)}"
+                f"{_edge_display_suffix(d, G.nodes[nid], neighbor=G.nodes[nb])}"
             )
     return lines
 
@@ -3075,15 +3147,16 @@ def _build_server(graph_path: str):
                 name="get_section",
                 description=(
                     "Return the text of a Markdown section (a heading node, with its "
-                    "subsections) or a whole Markdown page, read from the source "
-                    "file. Use it instead of opening the .md file after query_graph "
-                    "or get_node lands on a heading."
+                    "subsections), a whole Markdown page, or an indexed code example. "
+                    "Examples return their whole fence when current, otherwise a marked "
+                    "indexed preview. Use it instead of opening the .md file after "
+                    "query_graph or get_node lands on a heading or example."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "label": {"type": "string",
-                                  "description": "Heading label, node ID, or 'path/file.md::Heading' "
+                                  "description": "Heading/example label, node ID, or 'path/file.md::Heading' "
                                                  "when several files share the heading"},
                         "node_id": {"type": "string", "description": "Alias for label (node id)"},
                         "max_chars": {"type": "integer", "default": 8000,
@@ -3283,16 +3356,11 @@ def _build_server(graph_path: str):
         if err:
             return err
         d = G.nodes[nid]
-        attrs = d.get("attributes")
-        attrs_line = []
-        if isinstance(attrs, dict) and attrs:
-            raw_attrs = json.dumps(attrs, sort_keys=True)
-            if len(raw_attrs) > 1000:
-                raw_attrs = raw_attrs[:997] + "..."
-            attrs_line = [f"  Attributes: {_CONTROL_CHAR_RE.sub('', raw_attrs)}"]
+        attrs = _node_attributes_json(d)
+        attrs_line = [f"  Attributes: {attrs}"] if attrs else []
         # Sanitise every LLM-derived field before concatenation (F-010).
         return "\n".join([
-            f"Node: {sanitize_label(d.get('label', nid))}",
+            f"Node: {sanitize_label(redact_secrets(d.get('label', nid)))}",
             f"  ID: {sanitize_label(nid)}",
             f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
             # A C/C++/ObjC symbol declared in a header and defined in the sibling
@@ -3303,6 +3371,8 @@ def _build_server(graph_path: str):
               if d.get("definition_file") else []),
             *(["  Section: get_section returns this Markdown section's text"]
                if _is_section_node(d) else []),
+            *(["  Source view: credential-redacted; original literal values are unavailable. "
+               "Use inspect_semantics for captured-source provenance."] if d.get("source_redaction") else []),
             *(["  Framework evidence: use query_semantics with this source path, then inspect_semantics "
                "with a returned exact reference (file association only, not a guessed symbol binding)"]
               if str(d.get("source_file", "")) in (G.graph.get("semantic_evidence") or {}).get("documents", {}) else []),
@@ -3332,7 +3402,7 @@ def _build_server(graph_path: str):
         section, reason = read_section(d, section_root(Path(active_graph_path)), max_chars)
         if section is None:
             return sanitize_label(reason)
-        return format_section(section, sanitize_label(d.get("label", nid)))
+        return format_section(section, str(d.get("label", nid)))
 
     def _tool_get_neighbors(arguments: dict) -> str:
         raw = _node_arg(arguments)

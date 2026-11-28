@@ -3,8 +3,8 @@
 This is a closed version-1 contract, not generic graph metadata. Wire records are
 validated again when read from persisted graphs. No source files, compiler, model,
 symbol-name resolver, sanitizer, or ordinary edge deduplicator participates here.
-Credential-shaped source or evidence is rejected as a whole using Graphify's
-existing detector, never redacted under an unchanged source hash.
+Unredacted credential-shaped source or evidence is rejected. Sanitized snapshots
+have their own hash and explicit redaction provenance, never the original hash.
 
 Limits reject entire inputs rather than clipping records. Reader pages count the
 whole JSON response (``response_json``); an indivisible record that cannot fit is
@@ -19,6 +19,7 @@ import copy
 import hashlib
 import json
 import re
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, NotRequired, TypedDict, cast
@@ -30,7 +31,9 @@ from graphify.framework_config import (
     normalize_analysis_options,
     normalize_module_aliases,
 )
-from graphify.security import redact_secrets
+from graphify.security import (
+    SOURCE_REDACTION_MASKS, SOURCE_REDACTION_POLICY, SOURCE_REDACTION_REGEX_MASKS, redact_secrets,
+)
 
 
 SEMANTIC_EVIDENCE_KEY = "semantic_evidence"
@@ -43,7 +46,7 @@ ANNOTATION_LIMITS = {
     "maxDiagnostics": 32,
     "maxResultBytes": 8 * 1024 * 1024,
     "maxManifestBytes": 64 * 1024,
-    "maxPlugins": 8,
+    "maxPlugins": 32,
     "maxWork": 2_000_000,
     "maxDepth": 128,
     "maxValueBytes": 256 * 1024,
@@ -313,9 +316,17 @@ class Producer(TypedDict):
     configuration: ProducerConfiguration
 
 
+class SourceRedaction(TypedDict):
+    version: Literal[1]
+    policy: str
+    originalSourceHash: str
+    ranges: list[SourceSpan]
+
+
 class SourceDocument(TypedDict):
     source: str
     result: AnnotationResult
+    redaction: NotRequired[SourceRedaction]
 
 
 class FrameworkEvidencePayload(TypedDict):
@@ -456,6 +467,28 @@ def _path(value: Any) -> str:
     return value
 
 
+_JSON_ESCAPES = re.compile(r'["\\\x00-\x1f<>&\u2028\u2029]')
+_JSON_ESCAPE_BYTES = {
+    '"': 1, "\\": 1, "\b": 1, "\t": 1, "\n": 1, "\f": 1, "\r": 1,
+    "\u2028": 3, "\u2029": 3,
+}
+
+
+def _canonical_string_bytes(value: str, maximum: int) -> int:
+    """Size the exact wire string without allocating an unbounded escaped copy."""
+    size = len(value) + 2
+    _require(size <= maximum, "JSON byte limit exceeded")
+    if not value.isascii():
+        size = 2
+        for start in range(0, len(value), 4096):
+            size += len(_utf8(value[start:start + 4096]))
+            _require(size <= maximum, "JSON byte limit exceeded")
+    for match in _JSON_ESCAPES.finditer(value):
+        size += _JSON_ESCAPE_BYTES.get(match[0], 5)
+        _require(size <= maximum, "JSON byte limit exceeded")
+    return size
+
+
 def canonical_json(
     value: Any,
     *,
@@ -468,60 +501,82 @@ def canonical_json(
     Manifest keys are ASCII by schema. Store path keys may be Unicode; Python's
     code-point ordering defines their store-local content identity.
     """
-    chunks: list[str] = []
     seen: set[int] = set()
+    strings: dict[str, int] = {}
     work = 0
     size = 0
 
-    def append(text: str) -> None:
-        nonlocal size
-        size += len(_utf8(text))
-        _require(size <= max_bytes, "JSON byte limit exceeded")
-        chunks.append(text)
+    def string_size(text: str) -> int:
+        if len(text) > 256:
+            return _canonical_string_bytes(text, max_bytes - size)
+        cached = strings.get(text)
+        if cached is not None:
+            return cached
+        result = _canonical_string_bytes(text, max_bytes - size)
+        # Repeated wire keys and vocabulary dominate retained stores. Bound this
+        # call-local cache, excluding large source and expression strings.
+        if len(strings) < 4096:
+            strings[text] = result
+        return result
 
     def visit(item: Any, depth: int) -> None:
-        nonlocal work
+        nonlocal work, size
         work += 1
-        _require(work <= max_work and depth <= max_depth, "JSON structural limit exceeded")
+        if not (work <= max_work and depth <= max_depth):
+            raise EvidenceValidationError("JSON structural limit exceeded")
+        kind = type(item)
         if item is None:
-            append("null")
-        elif type(item) is bool:
-            append("true" if item else "false")
-        elif type(item) is int:
-            _integer(item, -MAX_SAFE_INTEGER, MAX_SAFE_INTEGER)
-            append(str(item))
-        elif type(item) is str:
-            _require(len(item) <= max_bytes, "JSON byte limit exceeded")
-            _utf8(item)
-            encoded = json.dumps(item, ensure_ascii=False)
-            for char in ("<", ">", "&", "\u2028", "\u2029"):
-                encoded = encoded.replace(char, f"\\u{ord(char):04x}")
-            append(encoded)
+            size += 4
+        elif kind is bool:
+            size += 4 if item else 5
+        elif kind is int:
+            if not -MAX_SAFE_INTEGER <= item <= MAX_SAFE_INTEGER:
+                raise EvidenceValidationError("Invalid integer or limit")
+            size += len(str(item))
+        elif kind is str:
+            size += string_size(item)
         else:
-            _require(type(item) in (dict, list) and id(item) not in seen, "Invalid JSON value")
+            if kind not in (dict, list) or id(item) in seen:
+                raise EvidenceValidationError("Invalid JSON value")
+            count = len(item)
+            if not count <= max_work:
+                raise EvidenceValidationError("JSON structural limit exceeded")
             seen.add(id(item))
-            _require(len(item) <= max_work, "JSON structural limit exceeded")
-            if type(item) is list:
-                append("[")
-                for index, child in enumerate(item):
-                    if index:
-                        append(",")
+            # Count delimiters, commas and colons before descending. Object keys
+            # still consume one work unit and one depth level, just like values.
+            size += 2 + max(0, count - 1) + (count if kind is dict else 0)
+            if not size <= max_bytes:
+                raise EvidenceValidationError("JSON byte limit exceeded")
+            if kind is list:
+                for child in item:
                     visit(child, depth + 1)
-                append("]")
             else:
-                _require(all(type(key) is str for key in item), "Invalid JSON object key")
-                append("{")
-                for index, key in enumerate(sorted(item)):
-                    if index:
-                        append(",")
-                    visit(key, depth + 1)
-                    append(":")
-                    visit(item[key], depth + 1)
-                append("}")
+                work += count
+                if not work <= max_work or count and not depth + 1 <= max_depth:
+                    raise EvidenceValidationError("JSON structural limit exceeded")
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise EvidenceValidationError("Invalid JSON object key")
+                    size += string_size(key)
+                    if not size <= max_bytes:
+                        raise EvidenceValidationError("JSON byte limit exceeded")
+                    visit(child, depth + 1)
             seen.remove(id(item))
+        if not size <= max_bytes:
+            raise EvidenceValidationError("JSON byte limit exceeded")
 
-    visit(value, 0)
-    return "".join(chunks)
+    try:
+        visit(value, 0)
+        # Preflight proves the output bound and excludes cycles, subclasses,
+        # floats and invalid Unicode before the C encoder allocates its result.
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                             separators=(",", ":"), check_circular=False)
+    except RecursionError as exc:
+        raise EvidenceValidationError("JSON structural limit exceeded") from exc
+    for char, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+                          ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+        encoded = encoded.replace(char, escaped)
+    return encoded
 
 
 def _digest(value: Any, limits: EvidenceLimits | None = None) -> str:
@@ -737,6 +792,31 @@ class _Coordinates:
         return value
 
 
+def validate_redaction(source: str, redaction: Any) -> SourceRedaction:
+    """Validate the safe snapshot and its non-secret transformation record."""
+    _object(redaction, ("version", "policy", "originalSourceHash", "ranges"))
+    _require(type(redaction["version"]) is int and redaction["version"] == 1, "Unsupported redaction version")
+    _require(redaction["policy"] == SOURCE_REDACTION_POLICY, "Unsupported source redaction policy")
+    _hash(redaction["originalSourceHash"])
+    coords = _Coordinates(source, ANNOTATION_LIMITS["maxSourceBytes"])
+    _require(
+        redaction["originalSourceHash"] != hashlib.sha256(coords.data).hexdigest(),
+        "Redaction must not claim the original source hash for changed text",
+    )
+    ranges = _array(redaction["ranges"], 4096)
+    _require(bool(ranges), "Empty source redaction record")
+    allowed = set(SOURCE_REDACTION_MASKS.values()) | set(SOURCE_REDACTION_REGEX_MASKS.values()) | {"\r", "\n"}
+    previous_end = -1
+    for value in ranges:
+        span = coords.span(value)
+        _require(span["startByte"] >= previous_end and span["endByte"] > span["startByte"], "Invalid redaction range ordering")
+        fragment = coords.data[span["startByte"]:span["endByte"]].decode("utf-8")
+        _require(all(character in allowed for character in fragment), "Redaction range contains unmasked text")
+        _require(any(character not in {"\r", "\n"} for character in fragment), "Empty credential redaction")
+        previous_end = span["endByte"]
+    return cast(SourceRedaction, copy.deepcopy(redaction))
+
+
 def _contains(outer: Mapping[str, Any], inner: Mapping[str, Any]) -> bool:
     return (
         outer["startByte"] <= inner["startByte"] <= inner["endByte"] <= outer["endByte"]
@@ -825,6 +905,12 @@ def _binding(value: Any, coords: _Coordinates, bounds: dict) -> None:
                 _object(shape, ("kind", "span", "length"))
                 _integer(shape["length"], 0, 64)
     canonical_json(value, max_bytes=bounds["maxValueBytes"])
+
+
+def _validated_json_key(value: Any) -> str:
+    """Internal equality only, after bounded JSON preflight; never a wire digest."""
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                      separators=(",", ":"), check_circular=False)
 
 
 def _result(value: Any, manifest: dict, source: Any) -> None:
@@ -987,7 +1073,7 @@ def _result(value: Any, manifest: dict, source: Any) -> None:
                 canonical_json(prop, max_bytes=bounds["maxValueBytes"])
             if not term["multiple"]:
                 property_key = (subject, fact["term"])
-                property_value = canonical_json(
+                property_value = _validated_json_key(
                     {k: fact[k] for k in ("resolution", "value") if k in fact}
                 )
                 _require(
@@ -1000,7 +1086,7 @@ def _result(value: Any, manifest: dict, source: Any) -> None:
             reports[pid] not in ("failed", "unsupported", "not-applicable"),
             "Facts contradict plugin report",
         )
-        identity = canonical_json(fact)
+        identity = _validated_json_key(fact)
         _require(identity not in seen_facts, "Duplicate exact fact")
         seen_facts.add(identity)
     states = list(reports.values())
@@ -1036,8 +1122,10 @@ def validate_payload(payload: Any, *, limits: EvidenceLimits | None = None) -> E
     _producer(payload["producer"], payload["manifest"])
     documents = {}
     for entry in _array(payload["documents"], limits.max_documents):
-        _object(entry, ("source", "result"))
+        _object(entry, ("source", "result"), ("redaction",))
         _result(entry["result"], payload["manifest"], entry["source"])
+        if "redaction" in entry:
+            validate_redaction(entry["source"], entry["redaction"])
         path = entry["result"]["relativePath"]
         _require(path not in documents, "Conflicting duplicate source ownership")
         documents[path] = {"producer": payload["producer"], **entry}
@@ -1081,7 +1169,8 @@ def validate_store(store: Any, *, limits: EvidenceLimits | None = None) -> Evide
 
     def document(entry: Any, path: str, *, head: bool) -> None:
         _object(
-            entry, ("producer", "source", "result"), ("retained", "refreshFailed") if head else ()
+            entry, ("producer", "source", "result"),
+            ("redaction", "retained", "refreshFailed") if head else ("redaction",),
         )
         _producer(entry["producer"])
         result: dict[str, Any] = entry["result"]
@@ -1092,6 +1181,8 @@ def validate_store(store: Any, *, limits: EvidenceLimits | None = None) -> Evide
             "Unknown document manifest",
         )
         _result(result, manifests[result["analysisSetId"]], entry["source"])
+        if "redaction" in entry:
+            validate_redaction(entry["source"], entry["redaction"])
         _producer(entry["producer"], manifests[result["analysisSetId"]])
         _require(
             entry["producer"] == producers[result["analysisSetId"]],
@@ -1190,6 +1281,8 @@ def merge_evidence(
                 if _complete(prior)
                 else prior.get("retained")
             )
+            if retained is not None and _complete(prior) and "redaction" in prior:
+                retained["redaction"] = copy.deepcopy(prior["redaction"])
             if retained is not None:
                 entry["retained"] = retained
         old["documents"][path] = entry
@@ -1202,6 +1295,8 @@ def merge_evidence(
                     source=entry["source"],
                     result=copy.deepcopy(entry["result"]),
                 )
+                if "redaction" in entry:
+                    entry["retained"]["redaction"] = copy.deepcopy(entry["redaction"])
             entry["refreshFailed"] = True
     return validate_store(old, limits=limits)
 
@@ -1219,6 +1314,43 @@ def extract_evidence(graph: Any, *, limits: EvidenceLimits | None = None) -> Evi
     if SEMANTIC_EVIDENCE_KEY not in graph.graph:
         return None
     return validate_store(graph.graph[SEMANTIC_EVIDENCE_KEY], limits=limits)
+
+
+# One graph only, invalidated by bounded content hashing, not mutable-object identity.
+# Reader responses are copied before returning so they cannot mutate this snapshot.
+_reader_snapshot: tuple | None = None
+
+
+def _remember_evidence(graph: Any, validated: EvidenceStore, limits: EvidenceLimits | None = None, *, digest: str | None = None) -> None:
+    """Seed the reader from an already validated load, without validating it twice."""
+    global _reader_snapshot
+    limits = limits or EvidenceLimits()
+
+    def released(reference):
+        global _reader_snapshot
+        if _reader_snapshot is not None and _reader_snapshot[0] is reference:
+            _reader_snapshot = None
+
+    try:
+        reference = weakref.ref(graph, released)
+    except TypeError:
+        return
+    source = graph.graph[SEMANTIC_EVIDENCE_KEY]
+    _reader_snapshot = (reference, source, limits, digest or _digest(source, limits), validated)
+
+
+def _read_evidence_snapshot(graph: Any, limits: EvidenceLimits) -> tuple[EvidenceStore | None, str]:
+    _require(hasattr(graph, "graph") and type(graph.graph) is dict, "Expected NetworkX graph")
+    if SEMANTIC_EVIDENCE_KEY not in graph.graph:
+        return None, ""
+    source = graph.graph[SEMANTIC_EVIDENCE_KEY]
+    digest = _digest(source, limits)
+    cached = _reader_snapshot
+    if cached is not None and cached[0]() is graph and cached[1] is source and cached[2] == limits and cached[3] == digest:
+        return cached[4], digest
+    store = validate_store(source, limits=limits)
+    _remember_evidence(graph, store, limits, digest=digest)
+    return store, digest
 
 
 def response_json(response: dict) -> str:
@@ -1246,7 +1378,7 @@ def _unsupported(reason: str, budget: int, **details: Any) -> dict:
 
 def _coverage(entry: Mapping[str, Any]) -> dict:
     result = entry["result"]
-    complete = _complete(entry)
+    complete = _complete(entry) and "redaction" not in entry
     state = (
         "failed"
         if entry.get("refreshFailed")
@@ -1254,7 +1386,7 @@ def _coverage(entry: Mapping[str, Any]) -> dict:
         if result["state"] in _GOOD and not complete
         else result["state"]
     )
-    return {
+    coverage = {
         "reportedState": result["state"],
         "effectiveState": state,
         "complete": complete,
@@ -1269,11 +1401,18 @@ def _coverage(entry: Mapping[str, Any]) -> dict:
         "retainedPreviousComplete": "retained" in entry,
         "scope": "source-analysis-only; not runtime execution or whole-program completeness",
     }
+    if "redaction" in entry:
+        coverage["sourceFidelity"] = "redacted"
+        coverage["redactedRangeCount"] = len(entry["redaction"]["ranges"])
+    return coverage
 
 
 def _source_reference(entry: Mapping[str, Any]) -> str:
     # Hash separately so an exactly maxResultBytes result remains addressable.
-    return "gfe1:source:" + _digest([entry["producer"], _digest(entry["result"])])
+    identity = [entry["producer"], _digest(entry["result"])]
+    if "redaction" in entry:
+        identity.append(entry["redaction"])
+    return "gfe1:source:" + _digest(identity)
 
 
 def _record_reference(source_ref: str, kind: str, record: Mapping[str, Any]) -> str:
@@ -1282,12 +1421,21 @@ def _record_reference(source_ref: str, kind: str, record: Mapping[str, Any]) -> 
 
 def _identity(entry: Mapping[str, Any]) -> dict:
     result = entry["result"]
-    return {
+    identity = {
         "relativePath": result["relativePath"],
         "sourceHash": result["sourceHash"],
         "analysisSetId": result["analysisSetId"],
         "producer": entry["producer"],
     }
+    if "redaction" in entry:
+        identity["redaction"] = {
+            "policy": entry["redaction"]["policy"],
+            "originalSourceHash": entry["redaction"]["originalSourceHash"],
+            "rangeCount": len(entry["redaction"]["ranges"]),
+            "coordinatesPreserved": ["utf8-bytes", "utf16-units", "lines"],
+            "literalValues": "redacted values do not describe the original literals",
+        }
+    return identity
 
 
 def _terms(manifest: Mapping[str, Any]) -> dict:
@@ -1344,14 +1492,15 @@ def query_semantics(
         _text(symbol)
     _integer(limit, 1, limits.max_page_items)
     try:
-        store = extract_evidence(graph, limits=limits)
+        store, store_digest = _read_evidence_snapshot(graph, limits)
     except EvidenceValidationError:
         return _unsupported("invalid-semantic-evidence", budget)
     if store is None:
         return _unsupported("semantic-evidence-not-indexed", budget)
-    scope = _digest(["query", _digest(store, limits), query, path, plugin, symbol])
+    scope = _digest(["query", store_digest, query, path, plugin, symbol])
     words = query.casefold().split()
     candidates = []
+    terms_by_manifest = {}
     for relative_path, entry in sorted(store["documents"].items()):
         if path is not None and relative_path != path and not relative_path.startswith(path + "/"):
             continue
@@ -1359,9 +1508,19 @@ def query_semantics(
         manifest = store["manifests"][result["analysisSetId"]]
         if plugin is not None and not any(p["id"] == plugin for p in manifest["plugins"]):
             continue
-        terms = _terms(manifest)
-        source_ref = _source_reference(entry)
+        declarations = result["declarations"]
+        if symbol is not None:
+            declarations = [declaration for declaration in declarations
+                            if symbol in [declaration["key"], declaration.get("name"), *declaration["exports"]]]
+            if not declarations:
+                continue
+        manifest_id = result["analysisSetId"]
+        if manifest_id not in terms_by_manifest:
+            terms_by_manifest[manifest_id] = _terms(manifest)
+        terms = terms_by_manifest[manifest_id]
+        source_ref = None
         if symbol is None and all(word in relative_path.casefold() for word in words):
+            source_ref = _source_reference(entry)
             candidates.append(
                 {
                     "kind": "source",
@@ -1372,19 +1531,12 @@ def query_semantics(
                     "factCount": len(result["facts"]),
                 }
             )
-        for declaration in result["declarations"]:
-            if symbol is not None and symbol not in [
-                declaration["key"],
-                declaration.get("name"),
-                *declaration["exports"],
-            ]:
-                continue
-            facts = [
-                f
-                for f in result["facts"]
-                if f["subject"] == declaration["key"]
-                and (plugin is None or f["evidence"]["pluginId"] == plugin)
-            ]
+        facts_by_subject: dict[str, list] = {}
+        for fact in result["facts"]:
+            if plugin is None or fact["evidence"]["pluginId"] == plugin:
+                facts_by_subject.setdefault(fact["subject"], []).append(fact)
+        for declaration in declarations:
+            facts = facts_by_subject.get(declaration["key"], [])
             if plugin is not None and not facts:
                 continue
             vocabulary = {
@@ -1393,14 +1545,17 @@ def query_semantics(
                 ]
                 for f in facts
             }
-            haystack = canonical_json(
-                [relative_path, declaration, facts, list(vocabulary.values())],
-                max_bytes=limits.max_store_bytes,
-                max_work=limits.max_work,
-                max_depth=limits.max_depth,
-            ).casefold()
-            if not all(word in haystack for word in words):
-                continue
+            if words:
+                haystack = canonical_json(
+                    [relative_path, declaration, facts, list(vocabulary.values())],
+                    max_bytes=limits.max_store_bytes,
+                    max_work=limits.max_work,
+                    max_depth=limits.max_depth,
+                ).casefold()
+                if not all(word in haystack for word in words):
+                    continue
+            if source_ref is None:
+                source_ref = _source_reference(entry)
             candidates.append(
                 {
                     "kind": "declaration",
@@ -1449,7 +1604,7 @@ def query_semantics(
                 )
             break
         response = attempt
-    return response
+    return copy.deepcopy(response)
 
 
 def _excerpt(
@@ -1464,7 +1619,7 @@ def _excerpt(
     end = min(start + maximum, span["endByte"])
     while end not in coords.boundaries:
         end -= 1
-    return {
+    excerpt = {
         "trust": "untrusted-source-data",
         "startByte": start,
         "endByte": end,
@@ -1475,6 +1630,13 @@ def _excerpt(
         "nextStartByte": end if end < span["endByte"] else None,
         "sourceEndByte": span["endByte"],
     }
+    if "redaction" in entry:
+        excerpt["sourceKind"] = "redacted-source-snapshot"
+        excerpt["redactions"] = [
+            value for value in entry.get("redaction", {}).get("ranges", [])
+            if value["startByte"] < end and value["endByte"] > start
+        ]
+    return excerpt
 
 
 def _reference_meaning(
@@ -1521,21 +1683,26 @@ def inspect_semantics(
     ):
         return _unsupported("invalid-evidence-reference", budget)
     try:
-        store = extract_evidence(graph, limits=limits)
+        store, store_digest = _read_evidence_snapshot(graph, limits)
     except EvidenceValidationError:
         return _unsupported("invalid-semantic-evidence", budget)
     if store is None:
         return _unsupported("semantic-evidence-not-indexed", budget)
+    requested_kind = reference.split(":")[1]
     found: tuple[StoredDocument, str, str, Any] | None = None
     for entry in store["documents"].values():
         source_ref = _source_reference(entry)
         if reference == source_ref:
             found = (entry, source_ref, "source", None)
             break
+        if requested_kind == "source":
+            continue
         for kind, records in (
             ("declaration", entry["result"]["declarations"]),
             ("fact", entry["result"]["facts"]),
         ):
+            if kind != requested_kind:
+                continue
             for record in records:
                 if reference == _record_reference(source_ref, kind, record):
                     found = (entry, source_ref, kind, record)
@@ -1578,7 +1745,7 @@ def inspect_semantics(
         if kind == "declaration"
         else selected["evidence"]["span"]
     )
-    scope = _digest(["inspect", _digest(store, limits), reference, excerpt_limit, excerpt_start])
+    scope = _digest(["inspect", store_digest, reference, excerpt_limit, excerpt_start])
     offset = _cursor_index(cursor, scope, len(units))
     if offset is None:
         return _unsupported("stale-or-invalid-continuation", budget)
@@ -1601,6 +1768,10 @@ def inspect_semantics(
         "truncated": offset < len(units),
         "continuation": _cursor(scope, offset) if offset < len(units) else None,
     }
+    if "redaction" in entry:
+        response["unknowns"].append(
+            "Credentials were masked before analysis; literal-dependent facts describe the redacted view, not original values."
+        )
     if _response_size(response) > budget:
         return _unsupported(
             "inspection-context-exceeds-budget", budget, requiredBytes=_response_size(response)
@@ -1662,4 +1833,4 @@ def inspect_semantics(
             break
         response = attempt
         added += 1
-    return response
+    return copy.deepcopy(response)

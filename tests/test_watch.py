@@ -89,13 +89,13 @@ def test_batch_doc_only_deletion_skips_llm_flag(tmp_path):
     assert not gone.exists()
     assert _batch_needs_llm_flag([gone]) is False
 
-def test_batch_modified_doc_only_does_not_rebuild(tmp_path):
-    """A doc that still exists needs LLM re-extraction, not an AST rebuild:
-    stays on the _notify_only path."""
-    doc = tmp_path / "docs" / "x.md"
+@pytest.mark.parametrize("suffix,structural", [(".md", True), (".txt", False)])
+def test_batch_modified_doc_refreshes_structure_and_flags_semantics(tmp_path, suffix, structural):
+    """Markdown refreshes structure immediately; semantic refresh stays separate."""
+    doc = tmp_path / "docs" / ("x" + suffix)
     doc.parent.mkdir()
     doc.write_text("# heading\n", encoding="utf-8")
-    assert _batch_triggers_rebuild([doc]) is False
+    assert _batch_triggers_rebuild([doc]) is structural
     assert _batch_needs_llm_flag([doc]) is True
 
 def test_batch_code_file_still_triggers_rebuild(tmp_path):
@@ -3161,7 +3161,7 @@ def test_graphifyignore_eviction_applies_to_incremental_rebuilds(tmp_path, capsy
     assert "newly-ignored file(s)" in capsys.readouterr().out
 
 
-# --- #1915: semantic-backed docs must not be double-represented by the AST quick-scan ---
+# --- Markdown structure and the preserved semantic layer coexist ---
 
 
 _SEMANTIC_GUIDE_IDS = {"guide_doc", "auth_flow", "session_model"}
@@ -3171,7 +3171,7 @@ _AST_GUIDE_IDS = {"guide", "guide_overview", "guide_setup", "guide_usage"}
 def _seed_semantic_doc_graph(corpus):
     """Build a code-only graph, then add guide.md represented ONLY semantically.
 
-    Mimics a graph produced by the CLI ``graphify . --update`` path: code AST
+    Mimics a legacy graph produced by the CLI ``graphify . --update`` path: code AST
     nodes plus a semantic (LLM) layer for the document — a ``<slug>_doc`` node
     and concept nodes, none carrying the ``_origin`` marker — and NO AST
     heading nodes for the doc.
@@ -3254,11 +3254,30 @@ def _seed_semantic_doc_graph_concept_only(corpus):
     return graph_path
 
 
-def test_rebuild_code_semantic_doc_not_double_represented_on_full_rebuild(tmp_path):
-    """#1915: a full _rebuild_code must not AST-quick-scan a doc whose semantic
-    (LLM) nodes already represent it. Before the fix the quick-scan minted
-    heading nodes ON TOP of the preserved semantic nodes, representing every
-    doc twice (~4x bloated graph vs the CLI update path)."""
+def _assert_doc_layers_preserved(before, after, semantic_ids, ast_ids=_AST_GUIDE_IDS):
+    by_id = {node["id"]: node for node in after["nodes"]}
+    assert semantic_ids | ast_ids <= by_id.keys()
+    assert all(by_id[nid]["_origin"] == "ast" for nid in ast_ids)
+    assert all(by_id[nid]["_origin"] == "semantic" for nid in semantic_ids)
+    for original in before["nodes"]:
+        assert all(by_id[original["id"]].get(key) == value for key, value in original.items())
+    for original in before["links"]:
+        assert any(all(edge.get(key) == value for key, value in original.items())
+                   for edge in after["links"]), original
+    assert len(after["nodes"]) == len(before["nodes"]) + len(ast_ids)
+
+
+def _assert_doc_rebuild_idempotent(corpus, graph_path, expected, changed_paths=None):
+    assert _rebuild_code(corpus, changed_paths=changed_paths, no_cluster=True, acquire_lock=False) is True
+    repeated = json.loads(graph_path.read_text(encoding="utf-8"))
+    for bucket in ("nodes", "links", "hyperedges"):
+        assert sorted(json.dumps(item, sort_keys=True) for item in repeated.get(bucket, [])) == sorted(
+            json.dumps(item, sort_keys=True) for item in expected.get(bucket, [])
+        ), bucket
+
+
+def test_rebuild_code_refreshes_structure_beside_semantic_doc_on_full_rebuild(tmp_path):
+    """A full structural refresh preserves the document's existing semantic data."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
@@ -3268,22 +3287,14 @@ def test_rebuild_code_semantic_doc_not_double_represented_on_full_rebuild(tmp_pa
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
 
     after = json.loads(graph_path.read_text(encoding="utf-8"))
-    after_ids = {n["id"] for n in after["nodes"]}
-    assert _SEMANTIC_GUIDE_IDS <= after_ids, "semantic doc nodes must be preserved"
-    assert not (_AST_GUIDE_IDS & after_ids), (
-        "AST heading nodes minted for a semantic-backed doc (#1915)"
-    )
-    assert len(after["nodes"]) == len(before["nodes"]), (
-        f"node count inflated {len(before['nodes'])} -> {len(after['nodes'])} (#1915)"
-    )
+    _assert_doc_layers_preserved(before, after, _SEMANTIC_GUIDE_IDS)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after)
 
 
-def test_rebuild_code_concept_only_semantic_doc_not_double_represented_on_full_rebuild(
+def test_rebuild_code_refreshes_structure_beside_concept_only_doc_on_full_rebuild(
     tmp_path,
 ):
-    """#1954: a doc represented ONLY by concept/rationale nodes (no
-    file_type=="document" node) must also be recognized as semantic-backed
-    and skipped by the AST quick-scan — not just docs with a "document" node."""
+    """Concept/rationale-only documents gain structure without losing meanings."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
@@ -3293,14 +3304,8 @@ def test_rebuild_code_concept_only_semantic_doc_not_double_represented_on_full_r
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
 
     after = json.loads(graph_path.read_text(encoding="utf-8"))
-    after_ids = {n["id"] for n in after["nodes"]}
-    assert _CONCEPT_ONLY_GUIDE_IDS <= after_ids, "semantic doc nodes must be preserved"
-    assert not (_AST_GUIDE_IDS & after_ids), (
-        "AST heading nodes minted for a concept-only semantic-backed doc (#1954)"
-    )
-    assert len(after["nodes"]) == len(before["nodes"]), (
-        f"node count inflated {len(before['nodes'])} -> {len(after['nodes'])} (#1954)"
-    )
+    _assert_doc_layers_preserved(before, after, _CONCEPT_ONLY_GUIDE_IDS)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after)
 
 
 @pytest.mark.parametrize(
@@ -3318,6 +3323,7 @@ def test_rebuild_code_incremental_preserves_semantic_doc_nodes_and_edges(
 
     corpus = tmp_path / "corpus"
     graph_path = _seed_semantic_doc_graph(corpus)
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(
         corpus, changed_paths=changed, no_cluster=True, acquire_lock=False
@@ -3339,9 +3345,8 @@ def test_rebuild_code_incremental_preserves_semantic_doc_nodes_and_edges(
         src == "auth_flow" and rel == "implemented_by"
         for src, _tgt, rel in relations
     ), "doc-to-code semantic edge dropped by an incremental rebuild"
-    assert not (_AST_GUIDE_IDS & after_ids), (
-        "incremental rebuild AST-quick-scanned a semantic-backed doc (#1915)"
-    )
+    _assert_doc_layers_preserved(before, after, _SEMANTIC_GUIDE_IDS)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after, changed)
 
 
 @pytest.mark.parametrize(
@@ -3352,13 +3357,12 @@ def test_rebuild_code_incremental_preserves_semantic_doc_nodes_and_edges(
 def test_rebuild_code_incremental_preserves_concept_only_semantic_doc_nodes_and_edges(
     tmp_path, changed
 ):
-    """#1954: incremental analogue — a concept/rationale-only semantic doc
-    must not lose its nodes/edges nor get AST-quick-scanned on an incremental
-    rebuild, mirroring the #1915 doc-node case above."""
+    """Refresh structure while preserving a concept/rationale-only semantic layer."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
     graph_path = _seed_semantic_doc_graph_concept_only(corpus)
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(
         corpus, changed_paths=changed, no_cluster=True, acquire_lock=False
@@ -3380,15 +3384,12 @@ def test_rebuild_code_incremental_preserves_concept_only_semantic_doc_nodes_and_
         src == "auth_flow" and rel == "implemented_by"
         for src, _tgt, rel in relations
     ), "doc-to-code semantic edge dropped by an incremental rebuild"
-    assert not (_AST_GUIDE_IDS & after_ids), (
-        "incremental rebuild AST-quick-scanned a concept-only semantic-backed doc (#1954)"
-    )
+    _assert_doc_layers_preserved(before, after, _CONCEPT_ONLY_GUIDE_IDS)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after, changed)
 
 
 def test_rebuild_code_quick_scans_doc_without_semantic_nodes(tmp_path):
-    """#09b33b7 guard: a doc with NO semantic layer still gets the AST
-    quick-scan so no-LLM corpora keep their heading structure — #1915's
-    semantic-supersedes-AST rule must not regress the fallback."""
+    """A document needs no semantic layer to receive searchable AST structure."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
@@ -3437,11 +3438,8 @@ def test_rebuild_code_quick_scans_markdown_classified_as_paper(tmp_path):
 
 
 @pytest.mark.parametrize("incremental", [False, True])
-def test_rebuild_code_does_not_quick_scan_semantic_backed_paper_markdown(tmp_path, incremental):
-    """#4750 x #1915: a paper-classified .md that already carries a semantic
-    (LLM) layer must not get an AST heading layer on top once papers enter the
-    quick-scan. Its semantic nodes stay the sole representation, on a full and
-    on an incremental rebuild."""
+def test_rebuild_code_refreshes_structure_beside_semantic_paper_markdown(tmp_path, incremental):
+    """Paper-classified Markdown retains semantics alongside refreshed structure."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
@@ -3468,24 +3466,17 @@ def test_rebuild_code_does_not_quick_scan_semantic_backed_paper_markdown(tmp_pat
          "confidence": "INFERRED", "source_file": "paper_notes.md"},
     )
     graph_path.write_text(json.dumps(data), encoding="utf-8")
-    before = len(data["nodes"])
-
     kwargs = {"changed_paths": [paper]} if incremental else {}
-    _rebuild_code(corpus, no_cluster=True, acquire_lock=False, **kwargs)
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False, **kwargs) is True
 
-    after = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
-    paper_ids = {n["id"] for n in after if Path(n.get("source_file") or "").name == "paper_notes.md"}
-    assert paper_ids == semantic_ids, f"AST layer added on a semantic-backed paper: {paper_ids - semantic_ids}"
-    assert len(after) == before
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    ast_ids = {"paper_notes", "paper_notes_notes_on_a_paper", "paper_notes_abstract"}
+    _assert_doc_layers_preserved(data, after, semantic_ids, ast_ids)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after, **kwargs)
 
 
 def test_full_rebuild_preserves_semantic_backed_doc_ast_layer(tmp_path):
-    """#2333 (COEXIST): a doc that carries BOTH an AST heading layer and a
-    semantic layer keeps both across a full rebuild. The doc is excluded from
-    extract_targets (#1915, no re-quick-scan), so its AST nodes are NOT
-    regenerated this run — the full-rebuild ownership rule must therefore not
-    drop them (it owns only rebuilt sources, not everything in watch_root).
-    Supersedes the pre-COEXIST #1915 self-heal, which deleted the AST layer."""
+    """Both tiers coexist: a full rebuild refreshes structure and keeps semantics."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
@@ -3512,8 +3503,7 @@ def test_full_rebuild_preserves_semantic_backed_doc_ast_layer(tmp_path):
     )
     graph_path.write_text(json.dumps(data), encoding="utf-8")
 
-    # Full rebuild WITHOUT force: guide.md is now semantic-backed, so it is
-    # excluded from extract_targets — its existing AST layer must survive.
+    # Full rebuild WITHOUT force still refreshes the semantic-backed doc's AST.
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
 
     after = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -3645,19 +3635,15 @@ def _seed_semantic_doc_graph_code_only(corpus):
     return graph_path
 
 
-def test_rebuild_code_code_only_semantic_doc_not_double_represented_on_full_rebuild(
+def test_rebuild_code_refreshes_structure_beside_code_only_semantic_doc_on_full_rebuild(
     tmp_path,
 ):
-    """#2014: a doc represented ONLY by code-typed semantic nodes (symbols
-    surfaced from within it) must be recognized as semantic-backed and skipped
-    by the AST quick-scan. Before the fix "code" was absent from the semantic
-    file_type gate, so the doc was re-AST-scanned — minting heading nodes AND
-    dropping the code-typed semantic nodes (they belonged to a now-rebuilt
-    source), silently losing them."""
+    """Doc-owned code mentions survive while their Markdown structure refreshes."""
     from graphify.watch import _rebuild_code
 
     corpus = tmp_path / "corpus"
     graph_path = _seed_semantic_doc_graph_code_only(corpus)
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
 
@@ -3666,9 +3652,8 @@ def test_rebuild_code_code_only_semantic_doc_not_double_represented_on_full_rebu
     assert _CODE_ONLY_GUIDE_IDS <= after_ids, (
         "code-typed semantic doc nodes dropped by a full rebuild (#2014)"
     )
-    assert not (_AST_GUIDE_IDS & after_ids), (
-        "AST heading nodes minted for a code-only semantic-backed doc (#2014)"
-    )
+    _assert_doc_layers_preserved(before, after, _CODE_ONLY_GUIDE_IDS)
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after)
 
 
 # ── #2051: deleted non-AST sources (docs/papers/images) get evicted ────────────
@@ -5121,9 +5106,22 @@ def _ast_reference(source, target, source_file, **extra):
     }
 
 
+def _assert_semantic_records_preserved(before, after):
+    for bucket in ("nodes", "links"):
+        for original in before[bucket]:
+            if original.get("_origin") == "semantic":
+                assert any(all(row.get(key) == value for key, value in original.items())
+                           for row in after[bucket]), original
+
+
+def _document_link_hints(data, source_file):
+    return [hint for node in data["nodes"] if node.get("source_file") == source_file
+            for hint in node.get("attributes", {}).get("document_links", [])]
+
+
 @pytest.mark.parametrize("suffix", [".md", ".mdx", ".qmd", ".skill"])
-def test_markdown_reconcile_links_new_source_to_semantic_target(tmp_path, suffix):
-    """#1915/#1954: a fresh source reaches a semantic-only target."""
+def test_markdown_reconcile_links_refreshed_pages_beside_semantic_target(tmp_path, suffix):
+    """A refreshed canonical page is the link target; its semantic layer survives."""
     source_file = f"a{suffix}"
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
@@ -5131,16 +5129,21 @@ def test_markdown_reconcile_links_new_source_to_semantic_target(tmp_path, suffix
         [_semantic_doc("b_sem", "b.md")],
         [],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert {references[0]["source"], references[0]["target"]} == {"a", "b_sem"}
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
+    assert _document_link_hints(after, source_file) == [{"target": "b.md", "source_location": "L1"}]
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after)
 
 
-def test_markdown_reconcile_preserves_ambiguous_target(tmp_path):
-    """#1915/#1954: an authored link must survive target ambiguity."""
+def test_markdown_reconcile_uses_page_without_choosing_between_target_meanings(tmp_path):
+    """Canonical document links do not choose or discard one of several meanings."""
     original = _ast_reference("a_sem", "b_one", "a.md", sentinel="keep")
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
@@ -5152,17 +5155,20 @@ def test_markdown_reconcile_preserves_ambiguous_target(tmp_path):
         ],
         [original],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert references[0]["sentinel"] == "keep"
-    assert {references[0]["source"], references[0]["target"]} == {"a_sem", "b_one"}
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
+    assert references[0]["_origin"] == "ast"
 
 
-def test_markdown_reconcile_preserves_ambiguous_source(tmp_path):
-    """#1915/#1954: an authored link must survive source ambiguity."""
+def test_markdown_reconcile_uses_page_without_choosing_between_source_meanings(tmp_path):
+    """The refreshed source page owns the link, independently of its meanings."""
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {"a.md": "[link](b.md)\n", "b.md": "target\n"},
@@ -5173,28 +5179,39 @@ def test_markdown_reconcile_preserves_ambiguous_source(tmp_path):
         ],
         [_ast_reference("a_one", "b_sem", "a.md", sentinel="keep")],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert references[0]["sentinel"] == "keep"
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
+    assert references[0]["_origin"] == "ast"
 
 
 @pytest.mark.parametrize("suffix", [".md", ".mdx", ".qmd", ".skill"])
 def test_markdown_reconcile_prunes_removed_authored_link(tmp_path, suffix):
-    """#1915/#1954: removing a Markdown link removes its owned AST edge."""
+    """Removing an authored link removes both its AST edge and stored hint."""
     source_file = f"a{suffix}"
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
-        {source_file: "no link\n", "b.md": "target\n"},
+        {source_file: "[link](b.md)\n", "b.md": "target\n"},
         [_semantic_doc("a_sem", source_file), _semantic_doc("b_sem", "b.md")],
         [_ast_reference("a_sem", "b_sem", source_file)],
     )
-
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
-    assert not any(edge.get("relation") == "references" for edge in links)
+    linked = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _document_link_hints(linked, source_file) == [{"target": "b.md", "source_location": "L1"}]
+
+    (corpus / source_file).write_text("no link\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    assert not any(edge.get("relation") == "references" for edge in after["links"])
+    assert _document_link_hints(after, source_file) == []
 
 
 @pytest.mark.parametrize("suffix", [".md", ".mdx", ".qmd", ".skill"])
@@ -5252,10 +5269,10 @@ def test_markdown_reconcile_preserves_links_on_extraction_error(
     real_extract = extract_module._safe_extract_with_xaml_root
     fail_source = True
 
-    def controlled_extract(extractor, path, root):
+    def controlled_extract(extractor, path, root, annotation_run=None):
         if fail_source and path.resolve() == source_path:
             return {"nodes": [], "edges": [], "error": "simulated read failure"}
-        return real_extract(extractor, path, root)
+        return real_extract(extractor, path, root, annotation_run)
 
     monkeypatch.setattr(
         extract_module, "_safe_extract_with_xaml_root", controlled_extract
@@ -5272,7 +5289,7 @@ def test_markdown_reconcile_preserves_links_on_extraction_error(
     links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert {references[0]["source"], references[0]["target"]} == {"a_sem", "b_sem"}
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
 
     (corpus / source_file).write_text("no link\n", encoding="utf-8")
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
@@ -5280,26 +5297,31 @@ def test_markdown_reconcile_preserves_links_on_extraction_error(
     assert not any(edge.get("relation") == "references" for edge in links)
 
 
-def test_markdown_reconcile_keeps_reverse_stored_edge_unchanged(tmp_path):
-    """#1915/#1954: undirected endpoint order must not churn edge data."""
+def test_markdown_reconcile_refreshes_reverse_stored_ast_link(tmp_path):
+    """An old reversed AST link is regenerated between canonical document pages."""
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {"a.md": "[link](b.md)\n", "b.md": "target\n"},
         [_semantic_doc("a_sem", "a.md"), _semantic_doc("b_sem", "b.md")],
         [_ast_reference("b_sem", "a_sem", "a.md", sentinel="keep")],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert references[0]["source"] == "b_sem"
-    assert references[0]["target"] == "a_sem"
-    assert references[0]["sentinel"] == "keep"
+    assert references[0]["source"] == "a"
+    assert references[0]["target"] == "b"
+    assert references[0]["source_file"] == "a.md"
+    assert references[0]["source_location"] == "L1"
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after)
 
 
 def test_markdown_reconcile_prefers_later_canonical_page(tmp_path):
-    """#1915/#1954: a later canonical page replaces a semantic fallback."""
+    """Canonical pages replace structural link fallbacks, not semantic records."""
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {"a.md": "[link](b.md)\n", "b.md": "target\n"},
@@ -5318,12 +5340,15 @@ def test_markdown_reconcile_prefers_later_canonical_page(tmp_path):
         ],
         [_ast_reference("a_sem", "b_sem", "a.md")],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert {references[0]["source"], references[0]["target"]} == {"a_sem", "b"}
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
 
 
 def test_markdown_reconcile_keeps_existing_semantic_relation(tmp_path):
@@ -5334,6 +5359,7 @@ def test_markdown_reconcile_keeps_existing_semantic_relation(tmp_path):
         "relation": "derived_from",
         "source_file": "a.md",
         "_origin": "semantic",
+        "rationale": "Documented derivation, not an authored hyperlink",
     }
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
@@ -5344,11 +5370,14 @@ def test_markdown_reconcile_keeps_existing_semantic_relation(tmp_path):
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
     links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
-    assert links == [semantic_edge]
+    assert [edge for edge in links if edge.get("_origin") == "semantic"] == [semantic_edge]
+    references = [edge for edge in links if edge.get("relation") == "references"]
+    assert len(references) == 1
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
 
 
-def test_markdown_reconcile_uses_legacy_page_fallback(tmp_path):
-    """#1915/#1954: a unique legacy page is a safe target fallback."""
+def test_markdown_reconcile_prefers_canonical_page_over_legacy_fallback(tmp_path):
+    """A legacy semantic page survives without owning refreshed structural links."""
     legacy_page = {
         "id": "legacy_b",
         "label": "b.md",
@@ -5363,17 +5392,19 @@ def test_markdown_reconcile_uses_legacy_page_fallback(tmp_path):
         [_semantic_doc("a_sem", "a.md"), legacy_page],
         [_ast_reference("a_sem", "legacy_b", "a.md", sentinel="keep")],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert {references[0]["source"], references[0]["target"]} == {"a_sem", "legacy_b"}
-    assert references[0]["sentinel"] == "keep"
+    assert {references[0]["source"], references[0]["target"]} == {"a", "b"}
 
 
 def test_markdown_reconcile_distinguishes_same_basename_paths(tmp_path):
-    """#1915/#1954: full relative paths disambiguate equal basenames."""
+    """Full paths disambiguate pages without replacing same-ID semantic meanings."""
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {"one/a.md": "[link](../two/a.md)\n", "two/a.md": "target\n"},
@@ -5383,12 +5414,19 @@ def test_markdown_reconcile_distinguishes_same_basename_paths(tmp_path):
         ],
         [_ast_reference("one_a", "two_a", "one/a.md", sentinel="keep")],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    pages = {n["source_file"]: n["id"] for n in after["nodes"]
+             if n.get("_origin") == "ast" and n.get("node_kind") == "page"}
+    assert pages.keys() == {"one/a.md", "two/a.md"}
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
     assert len(references) == 1
-    assert {references[0]["source"], references[0]["target"]} == {"one_a", "two_a"}
+    assert {references[0]["source"], references[0]["target"]} == set(pages.values())
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after, [corpus / "one/a.md"])
 
 
 def test_markdown_reconcile_does_not_resurrect_a_deleted_target(tmp_path):
@@ -5413,8 +5451,13 @@ def test_markdown_reconcile_does_not_resurrect_a_deleted_target(tmp_path):
     assert not any(
         edge.get("target") == "b_sem" for edge in links
     ), "no edge should still point at the deleted document's node"
+    assert not any(n.get("source_file") == "b.md" for n in data["nodes"])
+    assert _document_link_hints(data, "a.md") == [{"target": "b.md", "source_location": "L1"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in data["nodes"])
+
+
 def test_markdown_reconcile_preserves_case_different_unresolved_target(tmp_path):
-    """An unresolved authored site preserves its existing edge without guessing."""
+    """An unresolved authored destination remains searchable, not a stale edge."""
 
     original = _ast_reference(
         "source_sem",
@@ -5435,21 +5478,30 @@ def test_markdown_reconcile_preserves_case_different_unresolved_target(tmp_path)
         ],
         [original],
     )
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
 
-    assert references == [original]
+    assert references == []
+    assert _document_link_hints(after, "history/source.md") == [{"target": "target", "source_location": "L3"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
+    heading = next(n for n in after["nodes"] if n.get("node_kind") == "heading"
+                   and n.get("source_file") == "history/source.md")
+    assert heading["attributes"]["document_links"] == [{"target": "target", "source_location": "L3"}]
+    _assert_doc_rebuild_idempotent(corpus, graph_path, after, [corpus / "history/source.md"])
 
 
 def test_markdown_reconcile_prunes_removed_unresolved_link(tmp_path):
-    """Removing the unresolved authored link still prunes its existing edge."""
+    """Removing an unresolved authored link removes its literal metadata too."""
 
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {
-            "history/source.md": "# Source\n\nSee nothing.\n",
+            "history/source.md": "# Source\n\nSee [[target]] for detail.\n",
             "root/TARGET.md": "# Target\n\nBody.\n",
         },
         [
@@ -5466,12 +5518,21 @@ def test_markdown_reconcile_prunes_removed_unresolved_link(tmp_path):
             )
         ],
     )
-
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    linked = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _document_link_hints(linked, "history/source.md") == [{"target": "target", "source_location": "L3"}]
+
+    (corpus / "history/source.md").write_text("# Source\n\nSee nothing.\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
 
     assert len(references) == 0
+    assert _document_link_hints(after, "history/source.md") == []
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
 
 
 def test_markdown_reconcile_prunes_removed_colocated_unresolved_link(tmp_path):
@@ -5493,7 +5554,7 @@ def test_markdown_reconcile_prunes_removed_colocated_unresolved_link(tmp_path):
     corpus, graph_path = _markdown_reconcile_fixture(
         tmp_path,
         {
-            "history/source.md": "# Source\n\nSee [[target]] for detail.\n",
+            "history/source.md": "# Source\n\nSee [[target]] and [[removed]] for detail.\n",
             "root/TARGET.md": "# Target\n",
             "root/REMOVED.md": "# Removed\n",
         },
@@ -5504,11 +5565,23 @@ def test_markdown_reconcile_prunes_removed_colocated_unresolved_link(tmp_path):
         ],
         [keep, removed],
     )
-
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    linked = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _document_link_hints(linked, "history/source.md") == [
+        {"target": "target", "source_location": "L3"},
+        {"target": "removed", "source_location": "L3"},
+    ]
+
+    (corpus / "history/source.md").write_text("# Source\n\nSee [[target]] for detail.\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    _assert_semantic_records_preserved(before, after)
+    links = after["links"]
     references = [edge for edge in links if edge.get("relation") == "references"]
-    assert references == [keep]
+    assert references == []
+    assert _document_link_hints(after, "history/source.md") == [{"target": "target", "source_location": "L3"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
 
 
 def test_markdown_reconcile_does_not_suffix_match_unresolved_target(tmp_path):
@@ -5536,8 +5609,11 @@ def test_markdown_reconcile_does_not_suffix_match_unresolved_target(tmp_path):
     )
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    links = after["links"]
     assert not any(edge.get("relation") == "references" for edge in links)
+    assert _document_link_hints(after, "history/source.md") == [{"target": "foo_target", "source_location": "L3"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
 
 
 def test_markdown_reconcile_does_not_suffix_match_top_level_target(tmp_path):
@@ -5563,8 +5639,53 @@ def test_markdown_reconcile_does_not_suffix_match_top_level_target(tmp_path):
     )
 
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
-    links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    links = after["links"]
     assert not any(edge.get("relation") == "references" for edge in links)
+    assert _document_link_hints(after, "source.md") == [{"target": "foo_target", "source_location": "L3"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
+
+
+def test_markdown_document_link_hints_precede_resolution_and_redact_secrets(tmp_path, monkeypatch):
+    from graphify.extractors import markdown
+
+    secret = "ghp_" + "AbCd0123" * 5
+    path = tmp_path / "guide.md"
+    path.write_text('---\nconsulted: "[[front]]"\n---\n# Context\n'
+                    '[missing](missing.md#Part) [[TARGET#Section|alias]] [[#Local]]\n'
+                    f'[private]({secret}.md) [remote](https://example.invalid/spec)\n', encoding="utf-8")
+    monkeypatch.setattr(markdown, "_resolve_markdown_link", lambda *args, **kwargs: None)
+    fragment = markdown.extract_markdown(path)
+    page = next(n for n in fragment["nodes"] if n["node_kind"] == "page")
+    heading = next(n for n in fragment["nodes"] if n["node_kind"] == "heading")
+    assert page["attributes"]["document_links"] == [{"target": "front", "source_location": "L2"}]
+    assert heading["attributes"]["document_links"] == [
+        {"target": "missing.md#Part", "source_location": "L5"},
+        {"target": "TARGET#Section", "source_location": "L5"},
+        {"target": "#Local", "source_location": "L5"},
+        {"target": "[redacted].md", "source_location": "L6"},
+        {"target": "https://example.invalid/spec", "source_location": "L6"},
+    ]
+    assert secret not in json.dumps(fragment)
+    assert len(fragment["nodes"]) == 2
+    assert not any(e["relation"] == "references" for e in fragment["edges"])
+    assert not any(n.get("attributes", {}).get("code_hints") for n in fragment["nodes"])
+
+
+def test_markdown_link_hints_do_not_admit_excluded_documents(tmp_path):
+    corpus, graph_path = _markdown_reconcile_fixture(
+        tmp_path,
+        {"source.md": "# Source\n[omitted](src/libs/omitted.md)\n",
+         "src/libs/omitted.md": "# Must remain excluded\n",
+         ".graphifyignore": "src/libs/\n"},
+        [], [],
+    )
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert all(n.get("source_file") == "source.md" for n in after["nodes"])
+    assert not any(e["relation"] == "references" for e in after["links"])
+    assert _document_link_hints(after, "source.md") == [{"target": "src/libs/omitted.md", "source_location": "L2"}]
+    assert not any(n.get("attributes", {}).get("code_hints") for n in after["nodes"])
 
 
 # --- portable paths: definition_file travels with source_file --------------

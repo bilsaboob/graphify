@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import os
 import re
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,7 @@ from graphify.extractors.base import (
 )
 
 MARKDOWN_MENTION_SUFFIXES = frozenset({".md", ".mdx", ".qmd", ".skill"})
+DOCUMENTATION_EDGE_PRODUCER = "markdown-advisory-v1"
 
 _CONTAINMENT_RELATIONS = frozenset({"contains", "method"})
 
@@ -112,6 +114,17 @@ def _posix(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def _is_advisory_document(node: dict) -> bool:
+    """Scope new enrichment to Markdown or explicitly enriched document records."""
+    from graphify.detect import DOC_EXTENSIONS, PAPER_EXTENSIONS
+
+    suffix = Path(_posix(str(node.get("source_file") or ""))).suffix.lower()
+    return suffix == ".md" or (
+        node.get("node_kind") in {"doc_concept", "doc_mention", "code_example"}
+        and suffix in DOC_EXTENSIONS | PAPER_EXTENSIONS | MARKDOWN_MENTION_SUFFIXES | {".markdown"}
+    )
+
+
 def _match_cited_file(cited: str, doc_file: str, source_files: set[str]) -> str | None:
     """The scanned source file a ``path::Name`` mention names, or None.
 
@@ -159,13 +172,22 @@ def _match_cited_file_any_form(cited: str, doc_file: str,
     is the file the document's own directory tree names.
     """
     matched = _match_cited_file(cited, doc_file, source_files)
-    if matched is not None or not form_mismatch:
+    if matched is not None:
         return matched
     root = _posix(str(scan_root)) if scan_root is not None else None
     if root is None:
         active = _active_scan_root()
         if active is not None:
             root = _posix(str(active))
+    # Fresh Markdown can remain relative while unchanged code comes from an
+    # absolute cache record. Compare the same anchored path, not a loose suffix.
+    if root is not None and not os.path.isabs(doc_file):
+        absolute_doc = _posix(os.path.normpath(os.path.join(root, doc_file)))
+        matched = _match_cited_file(cited, absolute_doc, source_files)
+        if matched is not None:
+            return matched
+    if not form_mismatch:
+        return None
     joined = _posix(os.path.normpath(
         os.path.join(os.path.dirname(_posix(doc_file)), _posix(cited))))
     if root is not None:
@@ -297,6 +319,7 @@ def resolve_markdown_mentions(
         if source_file:
             by_file.setdefault(source_file, {}).setdefault(label, []).append(n["id"])
     source_files = set(by_file)
+    symbol_has_relative_paths = any(not os.path.isabs(sf) for sf in source_files)
 
     parents: dict[str, set[str]] = {}
     for e in all_edges:
@@ -328,8 +351,11 @@ def resolve_markdown_mentions(
         names = list(rc.get("qualifiers") or []) + [str(rc.get("callee", "")).strip()]
         cited = rc.get("path")
         if cited:
-            source_file = _match_cited_file(
-                str(cited), _posix(str(rc.get("source_file", ""))), source_files
+            doc_file = _posix(str(rc.get("source_file", "")))
+            source_file = _match_cited_file_any_form(
+                str(cited), doc_file, source_files,
+                form_mismatch=os.path.isabs(doc_file) and symbol_has_relative_paths,
+                scan_root=root,
             )
             if source_file is None:
                 return None, "EXTRACTED", 1.0
@@ -542,3 +568,348 @@ def resolve_markdown_mentions(
             for t in cited
         ):
             _add(rc, target, confidence, score)
+
+
+def enrich_documentation(
+    nodes: list[dict], edges: list[dict], *, root: str | Path | None = None,
+) -> None:
+    """Refresh advisory documentation links against final, already indexed IDs.
+
+    Source hints are never replaced with bindings. Only document-owned attributes
+    and this producer's edges change; callers must discard generated edges before
+    graph coalescing as well. A pair already carrying independent evidence wins,
+    with the blocked candidate retained on its document instead. No source IO or
+    transitive propagation of documentary claims takes place here.
+    """
+    from graphify.detect import DOC_EXTENSIONS, PAPER_EXTENSIONS
+    from graphify.extractors.markdown import _code_span_mention
+    from graphify.security import redact_secrets, sanitize_label
+
+    edges[:] = [e for e in edges if e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
+    by_id = {n["id"]: n for n in nodes if n.get("id")}
+
+    def source_key(value: Any) -> str:
+        value = _posix(str(value or ""))
+        if not value:
+            return ""
+        if root is not None and os.path.isabs(value):
+            try:
+                value = os.path.relpath(value, str(root))
+            except ValueError:
+                pass
+        return _posix(os.path.normpath(value))
+
+    sources = {nid: source_key(n.get("source_file")) for nid, n in by_id.items()}
+    doc_suffixes = DOC_EXTENSIONS | PAPER_EXTENSIONS | {".markdown"}
+    docs = {nid: n for nid, n in by_id.items() if _is_advisory_document(n)}
+    doc_files = {sources[nid] for nid in docs}
+    if not docs:
+        return
+
+    def attrs(node: dict) -> dict:
+        value = node.get("attributes")
+        return value if isinstance(value, dict) else {}
+
+    def normal(value: Any) -> str:
+        return " ".join(str(value or "").casefold().split())
+
+    def line(value: Any) -> int:
+        match = re.match(r"^(?:L)?([1-9][0-9]*)(?:\b|:)", str(value or ""))
+        return int(match[1]) if match else 0
+
+    def roles(value: Any) -> set[str]:
+        found = set(re.findall(r"\b(?:producer|consumer|documentation|example)\b", normal(value)))
+        return found & {"producer", "consumer"} or found
+
+    def reason(value: str) -> str:
+        return sanitize_label(redact_secrets(value))[:200]
+
+    for node in docs.values():
+        # Copy the attribute mapping: a caller can share it with an original row.
+        node["attributes"] = dict(attrs(node))
+        for key in ("code_resolution", "code_candidates", "section_resolution", "concept_candidates"):
+            node["attributes"].pop(key, None)
+
+    concepts = {nid for nid, n in docs.items()
+                if n.get("node_kind") == "doc_concept"
+                or (n.get("file_type") == "concept" and not n.get("node_kind"))}
+    mentions = {nid for nid, n in docs.items()
+                if n.get("node_kind") == "doc_mention"
+                or (n.get("file_type") == "code" and not _is_file_node(n)
+                    and n.get("node_kind") not in {"page", "heading", "doc_concept", "code_example"})}
+    # File nodes are eligible only for an explicit original-ID hint below, not
+    # for ordinary label matching. Legacy paper/Markdown stubs are never code.
+    doc_code_suffixes = MARKDOWN_MENTION_SUFFIXES | PAPER_EXTENSIONS | {".markdown"}
+    indexed_code = {nid: n for nid, n in by_id.items()
+                    if nid not in docs and n.get("file_type") == "code" and sources[nid]
+                    and Path(sources[nid]).suffix.lower() not in doc_code_suffixes
+                    and not n.get("external") and n.get("type") != "external"
+                    and n.get("node_kind") not in {"page", "heading", "doc_mention", "doc_concept", "code_example"}}
+    code = {nid: n for nid, n in indexed_code.items() if not _is_file_node(n) and n.get("node_kind") != "file"}
+    labels: dict[str, list[str]] = {}
+    file_suffixes: dict[str, set[str]] = {}
+    for nid in sorted(code):
+        labels.setdefault(_symbol_label(code[nid]), []).append(nid)
+    code_files = {sources[nid] for nid in code}
+    for source in code_files:
+        parts = source.split("/")
+        for offset in range(len(parts)):
+            file_suffixes.setdefault("/".join(parts[offset:]), set()).add(source)
+
+    parents: dict[str, set[str]] = {}
+    section_parents: dict[str, set[str]] = {}
+    participant_roles: dict[str, set[str]] = {}
+    claims: dict[str, list[tuple[str, dict]]] = {}
+    doc_links: set[frozenset[str]] = set()
+    code_targets: dict[str, set[str]] = {}
+    # Reserve reverse pairs too: some publication paths still use a simple Graph.
+    occupied = {frozenset((e.get("source"), e.get("target"))) for e in edges}
+    for edge in edges:
+        src, dst = edge.get("source"), edge.get("target")
+        relation = edge.get("relation")
+        if relation in _CONTAINMENT_RELATIONS:
+            if src in by_id and dst in by_id and src not in docs and dst not in docs:
+                parents.setdefault(dst, set()).add(src)
+            if src in docs and dst in docs and sources[src] == sources[dst]:
+                section_parents.setdefault(dst, set()).add(src)
+        if src in docs and dst in code and relation == "references":
+            code_targets.setdefault(src, set()).add(dst)
+        if dst in docs and src in code and relation == "references":
+            code_targets.setdefault(dst, set()).add(src)
+        if src not in docs or dst not in docs:
+            continue
+        if relation == "references" and sources[src] != sources[dst]:
+            doc_links.add(frozenset((sources[src], sources[dst])))
+        edge_roles = roles(edge.get("context")) | roles(edge.get("role"))
+        for participant in ({src, dst} & mentions) or {dst}:
+            participant_roles.setdefault(participant, set()).update(edge_roles)
+        if relation not in _CONTAINMENT_RELATIONS:
+            if src in concepts and dst in mentions:
+                claims.setdefault(src, []).append((dst, edge))
+            if dst in concepts and src in mentions:
+                claims.setdefault(dst, []).append((src, edge))
+
+    def add_edge(src: str, dst: str, relation: str, context: str, confidence: str,
+                 match_reason: str, site: dict, *, location: Any = None,
+                 score: float = 0.75) -> bool:
+        pair = frozenset((src, dst))
+        if src == dst or pair in occupied:
+            return False
+        occupied.add(pair)
+        edges.append({
+            "source": src, "target": dst, "relation": relation, "context": context,
+            "confidence": confidence, "confidence_score": score, "weight": 1.0,
+            "source_file": site.get("source_file", ""),
+            "source_location": location if location is not None else site.get("source_location"),
+            "match_reason": reason(match_reason),
+            "_origin": site.get("_origin") or "semantic",
+            "_generated_by": DOCUMENTATION_EDGE_PRODUCER,
+        })
+        return True
+
+    pages: dict[str, list[str]] = {}
+    headings: dict[tuple[str, str], list[str]] = {}
+    heading_lines: dict[str, dict[int, list[str]]] = {}
+    for nid, node in docs.items():
+        sf = sources[nid]
+        if node.get("node_kind") == "page":
+            pages.setdefault(sf, []).append(nid)
+        elif node.get("node_kind") == "heading":
+            headings.setdefault((sf, normal(node.get("label"))), []).append(nid)
+            at = line(node.get("source_location"))
+            if at:
+                heading_lines.setdefault(sf, {}).setdefault(at, []).append(nid)
+    starts = {sf: sorted(lines) for sf, lines in heading_lines.items()}
+    for nid in sorted(concepts | mentions | {nid for nid, n in docs.items()
+                                          if n.get("node_kind") == "code_example"}):
+        node = docs[nid]
+        sf = sources[nid]
+        section = attrs(node).get("section") or attrs(node).get("heading")
+        locator = section if isinstance(section, dict) else {}
+        section_source = locator.get("source_file")
+        title = locator.get("heading") or locator.get("label")
+        at = line(locator.get("source_location") or locator.get("start_line"))
+        if isinstance(section, str):
+            prefix, sep, heading = section.partition("::")
+            if sep and Path(prefix).suffix.lower() in doc_suffixes:
+                section_source, title = prefix, heading
+            else:
+                title = section
+            title = title.lstrip("#").strip()
+            at = line(title) if re.fullmatch(r"L[1-9][0-9]*(?::[0-9]+)?", title) else 0
+            if at:
+                title = None
+        at = at or line(node.get("source_location")) or line(attrs(node).get("start_line"))
+        positions = starts.get(sf, [])
+        pos = bisect_right(positions, at) - 1
+        located = (heading_lines[sf][positions[pos]] if pos >= 0 else [])
+        candidates = headings.get((sf, normal(title)), []) if title else located
+        if len(candidates) > 1 and len(located) == 1 and located[0] in candidates:
+            candidates = located
+        if not title and not at:
+            candidates = [parent for parent in section_parents.get(nid, ())
+                          if docs[parent].get("node_kind") == "heading"]
+        if section_source and source_key(section_source) != sf:
+            candidates = []
+        target = candidates[0] if len(candidates) == 1 else None
+        status = "section" if target else "page"
+        if target is None and pages.get(sf):
+            target = min(pages[sf])
+        resolution = {"status": status if target else "unresolved", "source_file": node.get("source_file")}
+        if target:
+            resolution.update(target_id=target, source_location=docs[target].get("source_location"))
+            add_edge(target, nid, "contains", "documentation", "INFERRED",
+                     "document section" if status == "section" else "document page fallback", node)
+        attrs(node)["section_resolution"] = resolution
+
+    evidence_cache: dict[str, set[str]] = {}
+    path_cache: dict[tuple[str, str], str | None] = {}
+    match_cache: dict[tuple, tuple[list[str], str, bool]] = {}
+
+    def candidates(hint: dict, sf: str) -> tuple[list[str], str, bool]:
+        text = str(hint.get("text") or "").strip().strip("`")
+        if hint.get("kind") == "id_collision":
+            return ([text] if text in indexed_code else [], "weak original documentary ID match", True)
+        parsed = _code_span_mention(text)
+        # The inline grammar deliberately excludes constants. Persisted semantic
+        # hints may name indexed fields too, so keep their simple name chains.
+        cited, names = parsed if parsed is not None else (
+            None, re.split(r"::|[.\\]", _symbol_label({"label": text})))
+        cited = str(hint.get("path") or cited or "")
+        qualifiers = hint.get("qualifiers") or []
+        if isinstance(qualifiers, str):
+            qualifiers = re.split(r"::|[.\\]", qualifiers)
+        if not isinstance(qualifiers, (list, tuple)):
+            qualifiers = [qualifiers]
+        wanted = set(str(q) for q in qualifiers) | set(names[:-1])
+        name = names[-1] if names else ""
+        key = (name, tuple(sorted(wanted)), cited, sf if cited else "")
+        if key in match_cache:
+            return match_cache[key]
+        found = labels.get(name, [])
+        failures = []
+        matched_file = None
+        if cited:
+            path_key = (sf, cited)
+            if path_key not in path_cache:
+                path = source_key(cited) if os.path.isabs(cited) else _posix(cited)
+                joined = source_key(os.path.join(os.path.dirname(sf), path))
+                pool = set(file_suffixes.get(_RELATIVE_PREFIX_RE.sub("", path), ()))
+                pool.update(f for f in (joined, source_key(path)) if f in code_files)
+                path_cache[path_key] = _match_cited_file_any_form(
+                    path, sf, pool, form_mismatch=os.path.isabs(sf)
+                    and any(not os.path.isabs(f) for f in pool), scan_root=root,
+                )
+            matched_file = path_cache[path_key]
+            narrowed = [nid for nid in found if sources[nid] == matched_file]
+            if narrowed:
+                found = narrowed
+            else:
+                failures.append("path not matched")
+        if wanted:
+            for nid in found:
+                if nid not in evidence_cache:
+                    evidence_cache[nid] = _evidence(nid, by_id, parents)
+            narrowed = [nid for nid in found if wanted <= evidence_cache[nid]]
+            if narrowed:
+                found = narrowed
+            else:
+                failures.append("qualifiers not matched")
+        why = "weak name match; " + "; ".join(failures) if failures else "name match"
+        if not failures:
+            if matched_file:
+                why += "; cited file"
+            if wanted:
+                why += "; owner/path qualifiers"
+        result = (found, why, bool(failures))
+        match_cache[key] = result
+        return result
+
+    hints: dict[str, list[dict]] = {}
+    for nid, node in docs.items():
+        value = attrs(node).get("code_hints")
+        hints[nid] = [h for h in value if isinstance(h, dict) and h.get("text")] if isinstance(value, list) else []
+        if nid in mentions and node.get("label") and (
+            not hints[nid] or all(h.get("kind") == "id_collision" for h in hints[nid])
+        ):
+            hints[nid].insert(0, {"text": node["label"], "source_location": node.get("source_location")})
+
+    for nid in sorted(docs):
+        node = docs[nid]
+        work = [(hint, node, None) for hint in hints[nid]]
+        for mention, claim in claims.get(nid, []):
+            work.extend((hint, docs[mention], claim) for hint in hints[mention])
+        if not work:
+            continue
+        counts = {"matched": 0, "ambiguous": 0, "unresolved": 0}
+        for hint, owner, claim in work:
+            found, why, weak = candidates(hint, sources[owner["id"]])
+            confidence = "AMBIGUOUS" if weak or len(found) > 1 else "INFERRED"
+            counts["unresolved" if not found else "ambiguous" if confidence == "AMBIGUOUS" else "matched"] += 1
+            site = owner
+            location = hint.get("source_location") or owner.get("source_location")
+            contexts = roles(hint.get("role")) | participant_roles.get(owner["id"], set())
+            if claim is not None:
+                site = dict(node)
+                if source_key(claim.get("source_file")) in doc_files:
+                    site["source_file"] = claim["source_file"]
+                site["_origin"] = claim.get("_origin") or node.get("_origin") or "semantic"
+                if source_key(site.get("source_file")) != sources[owner["id"]]:
+                    location = node.get("source_location")
+                location = claim.get("source_location") or location
+                contexts = roles(claim.get("context")) | roles(claim.get("role")) or contexts
+                why = f"documented {claim.get('relation', 'reference')} via mention; {why}"
+            contexts = contexts & {"producer", "consumer"} or contexts
+            contexts = contexts or {"example" if node.get("node_kind") == "code_example" else "documentation"}
+            for target in found:
+                code_targets.setdefault(nid, set()).add(target)
+                for context in sorted(contexts):
+                    if not add_edge(nid, target, "references", context, confidence, why, site,
+                                    location=location, score=0.35 if weak else 0.5 if len(found) > 1 else 0.75):
+                        detail = {"hint": hint["text"], "target_id": target,
+                                  "confidence": confidence, "context": context,
+                                  "source_file": site.get("source_file"), "source_location": location,
+                                  "match_reason": reason(why)}
+                        if claim is not None:
+                            detail["via"] = owner["id"]
+                        attrs(node).setdefault("code_candidates", []).append(detail)
+        attrs(node)["code_resolution"] = counts
+
+    buckets: dict[str, set[str]] = {}
+    for nid in sorted(concepts):
+        aliases = attrs(docs[nid]).get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if not isinstance(aliases, list):
+            aliases = []
+        for label in [docs[nid].get("label"), *aliases]:
+            key = normal(label) if isinstance(label, str) else ""
+            if key:
+                buckets.setdefault(key, set()).add(nid)
+    paired: set[tuple[str, str]] = set()
+    for key in sorted(buckets):
+        by_source: dict[str, list[str]] = {}
+        for nid in sorted(buckets[key]):
+            by_source.setdefault(sources[nid], []).append(nid)
+        groups = list(by_source.values())
+        for offset, group in enumerate(groups):
+            for other in groups[offset + 1:]:
+                for left in group:
+                    for right in other:
+                        src, dst = sorted((left, right))
+                        if (src, dst) in paired:
+                            continue
+                        paired.add((src, dst))
+                        why = "shared full concept label/alias"
+                        linked = frozenset((sources[src], sources[dst])) in doc_links
+                        shared = bool(code_targets.get(src, set()) & code_targets.get(dst, set()))
+                        if linked:
+                            why += "; documented link"
+                        if shared:
+                            why += "; shared code candidate"
+                        confidence = "INFERRED" if linked or shared else "AMBIGUOUS"
+                        if not add_edge(src, dst, "conceptually_related_to", "documentation",
+                                        confidence, why, docs[src], score=0.65 if linked or shared else 0.25):
+                            attrs(docs[src]).setdefault("concept_candidates", []).append({
+                                "target_id": dst, "confidence": confidence, "match_reason": reason(why),
+                            })

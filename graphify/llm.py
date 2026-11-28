@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from graphify.extractors.base import _read_source_text
+from graphify.security import redact_secrets
 from graphify.file_slice import (
     FileSlice,
     bisect_slice,
@@ -204,6 +205,13 @@ BACKENDS: dict[str, dict] = {
         # overrides either way (#1191).
         "temperature": 0,
         "vision": True,
+    },
+    "openai-oauth": {
+        # Explicit subscription route. No API key or ambient OpenAI configuration.
+        "default_model": "",
+        "model_env_key": "GRAPHIFY_OPENAI_MODEL",
+        "pricing": None,
+        "vision": False,
     },
     "deepseek": {
         # DEEPSEEK_BASE_URL points the backend at any OpenAI-compatible server for
@@ -582,6 +590,21 @@ solely for such a cross-document reference. Never add this marker to a node
 defined by the enclosing source. Never invent, shorten or rewrite a path, and
 never omit source_file.
 
+Documentation metadata (optional, omit unavailable fields): on document-owned
+nodes, `attributes.summary` is a short description, `attributes.aliases` a list
+of explicit alternative names, and `attributes.section` a source heading or
+line locator, never a graph ID. Keep code identifiers/imports/paths as
+`attributes.code_hints`: [{"text":"original mention","source_location":"L12",
+"path":"optional cited path","qualifiers":["optional owner"],"role":"optional participant role"}].
+Retain unresolved hints, uncertain claims and incomplete examples without
+requiring a matching implementation symbol. Keep distinct document meanings
+and examples separate, even when their labels match. Examples are documentation,
+not production declarations or proof of production calls: use `references`, not
+`calls`, for documentation/example references. Preserve documented participants
+and producer/consumer roles in reference edges' optional `context` and `role`
+fields (documentation, example, producer, consumer), without inventing a static
+call. Never emit runtime-owned origin, resolution or generated-link markers.
+
 Node ID format: lowercase, word characters only (`[^\\W]` after casefolding, i.e. `[a-z0-9_]` for ASCII input but non-ASCII letters and digits are kept as-is), no dots or slashes.
 Format: {stem}_{entity} where stem = full repo-relative path with the extension dropped, every segment joined with _ (e.g. src/auth/session.py -> src_auth_session); entity = symbol name (both normalised). Top-level files use just the filename stem (setup.py -> setup).
 
@@ -592,7 +615,7 @@ Edge direction rule — source is always the ACTOR, target is the ACTED-UPON:
 
 Hyperedges: if 3 or more nodes clearly participate together in a shared concept, flow, or pattern that is not captured by pairwise edges alone, add a hyperedge to the top-level `hyperedges` array (e.g. all classes implementing one protocol, all functions in one auth flow even if they don't all call each other, all concepts from a paper section forming one coherent idea). Use sparingly — only when the group relationship adds information beyond the pairwise edges. Maximum 3 hyperedges per chunk.
 
-Output exactly this schema:
+Output this schema; the optional documentation attributes/context/role above may be added:
 {"nodes":[{"id":"stem_entity","label":"Human Readable Name","file_type":"code|document|paper|image|rationale|concept","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null,"rationale":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[{"id":"snake_case_id","label":"Human Readable Label","nodes":["node_id1","node_id2","node_id3"],"relation":"participate_in|implement|form","confidence":"EXTRACTED|INFERRED","confidence_score":0.75,"source_file":"relative/path"}],"input_tokens":0,"output_tokens":0}
 """
 
@@ -1086,6 +1109,81 @@ def _bedrock_content(user_message: str, refs: list[_ImageRef]) -> list[dict]:
 
 
 _LLM_JSON_MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap before json.loads (F-016)
+
+
+def prepare_markdown_semantics(fragment: dict) -> dict:
+    """Normalize fresh/cached semantic rows in place, never structural fragments.
+
+    Retain source attribution, IDs, claims and flags, without binding symbols.
+    Model-supplied AST stamps and runtime candidate metadata are not authority.
+    """
+    from graphify.build import _fold_confidence
+    from graphify.validate import VALID_FILE_TYPES
+
+    def markdown_owned(row: dict) -> bool:
+        source = row.get("source_file")
+        return isinstance(source, str) and source.lower().endswith(".md")
+
+    def redacted(value):
+        if isinstance(value, str):
+            return redact_secrets(value)
+        if isinstance(value, list):
+            return [redacted(item) for item in value]
+        if isinstance(value, dict):
+            return {key: redacted(item) for key, item in value.items()}
+        return value
+
+    doc_ids = {
+        n["id"] for n in fragment.get("nodes", []) or []
+        if isinstance(n, dict) and isinstance(n.get("id"), str) and markdown_owned(n)
+    }
+    for bucket in ("nodes", "edges", "hyperedges"):
+        for row in fragment.get(bucket, []) or []:
+            if not isinstance(row, dict):
+                continue
+            members = (row.get("nodes") if bucket == "hyperedges"
+                       else [row.get("source"), row.get("target")])
+            doc_owned = markdown_owned(row) or (
+                bucket != "nodes" and isinstance(members, list)
+                and any(isinstance(member, str) and member in doc_ids for member in members)
+            )
+            if doc_owned:
+                row["_origin"] = "semantic"
+                if "confidence" in row:
+                    row["confidence"] = redacted(row["confidence"])
+                _fold_confidence(row)
+                if bucket == "edges" and row.get("relation") in ("calls", "imports", "imports_from"):
+                    # Preserve the documented claim without admitting an example
+                    # or prose assertion into the production call graph.
+                    row["documented_relation"] = row["relation"]
+                    row["relation"] = "references"
+                    if row.get("context") not in ("documentation", "example", "producer", "consumer"):
+                        row["context"] = "documentation"
+                    row.setdefault("match_reason", f"documented {row['documented_relation']}; not static code evidence")
+                if bucket == "nodes":
+                    file_type = row.get("file_type")
+                    if not isinstance(file_type, str) or file_type not in VALID_FILE_TYPES:
+                        attrs = row.get("attributes")
+                        if not isinstance(attrs, dict):
+                            attrs = {} if attrs is None else {"original_attributes": redacted(attrs)}
+                            row["attributes"] = attrs
+                        if file_type is not None:
+                            attrs["model_file_type"] = redacted(file_type)
+                        row["file_type"] = "concept"
+                    row["node_kind"] = "doc_mention" if row["file_type"] == "code" else "doc_concept"
+                attrs = row.get("attributes")
+                if isinstance(attrs, dict):
+                    for key in ("summary", "aliases", "section", "code_hints", "preview", "language"):
+                        if key in attrs:
+                            attrs[key] = redacted(attrs[key])
+            for data in (row, row.get("attributes"), row.get("metadata")):
+                if not isinstance(data, dict):
+                    continue
+                if data.get("_generated_by") in ("markdown-advisory-v1", "markdown-reference-anchor-v1"):
+                    data.pop("_generated_by")
+                for key in ("code_resolution", "code_candidates", "section_resolution", "concept_candidates", "retained_reference_anchor"):
+                    data.pop(key, None)
+    return fragment
 
 
 def _sanitize_fragment(parsed: dict) -> dict:
@@ -1603,6 +1701,8 @@ def _call_ollama_native(
         "options": options,
         "keep_alive": extra.get("keep_alive", "30m"),
     }
+    if (kwargs.get("response_format") or {}).get("type") == "json_object":
+        body["format"] = "json"
     if _thinking_disabled_via_env():
         body["think"] = False
     try:
@@ -1686,6 +1786,10 @@ def _call_openai_compat(
         kwargs["reasoning_effort"] = reasoning_effort
     if ollama_seed is not None:
         kwargs["seed"] = ollama_seed
+    if backend == "ollama" and extra_body is None:
+        # Extraction requires a JSON graph. Native Ollama otherwise allows an
+        # early prose/invalid-token stop even when the context comfortably fits.
+        kwargs["response_format"] = {"type": "json_object"}
     # A custom provider in providers.json can pass its own extra_body (e.g.
     # `chat_template_kwargs.enable_thinking=false` for self-hosted Qwen3 served
     # by vLLM). When supplied, it wins over the moonshot default — the user has
@@ -2267,7 +2371,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "openai-oauth"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -2293,6 +2397,13 @@ def extract_files_direct(
         result = _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "bedrock":
         result = _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    elif backend == "openai-oauth":
+        from graphify.oauth_responses import extract_graph
+
+        result = extract_graph(
+            mdl, _extraction_system(deep=deep_mode), _with_image_notes(user_msg, image_refs),
+            parse_graph=_parse_llm_json,
+        )
     elif backend == "azure":
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
         if not endpoint:
@@ -2336,6 +2447,15 @@ def extract_files_direct(
     # the model actually saw (text_files, same cap as _read_files); images are
     # excluded (binary, unverifiable). Best-effort — never abort extraction.
     if isinstance(result, dict):
+        from .cache import scope_semantic_result
+
+        _, rejected = scope_semantic_result(result, root, (unit_path(f) for f in files))
+        if rejected:
+            print(
+                f"[graphify] WARNING: dropped {rejected} semantic item(s) with invalid "
+                "source ownership or dependent references; dispatched files remain partial.",
+                file=sys.stderr,
+            )
         try:
             _n_unverified = _bind_node_evidence(result, text_files, root)
             if _n_unverified:
@@ -2346,7 +2466,7 @@ def extract_files_direct(
                 )
         except Exception as _exc:  # noqa: BLE001 — evidence-binding is advisory
             print(f"[graphify] evidence-binding skipped: {_exc}", file=sys.stderr)
-    return result
+    return prepare_markdown_semantics(result) if isinstance(result, dict) else result
 
 
 # Estimating a PDF means extracting its text, and packing asks for the same
@@ -3266,13 +3386,14 @@ def _stamp_semantic_origin(result: dict) -> dict:
     those nodes read as AST, and the next incremental rebuild deleted them
     with the re-extracted code file they seemed to belong to (#2843).
     extract() stamps its items ``ast``; this is the semantic counterpart.
-    Existing stamps are kept (``setdefault``); returns ``result``.
+    Existing stamps outside Markdown are kept; Markdown semantics are always
+    restamped, including hyperedges. Returns ``result``.
     """
     for key in ("nodes", "edges"):
         for item in result.get(key, []) or []:
             if isinstance(item, dict):
                 item.setdefault("_origin", "semantic")
-    return result
+    return prepare_markdown_semantics(result)
 
 
 def _merge_into(merged: dict, result: dict) -> None:
@@ -3318,6 +3439,10 @@ def _call_llm(
     """
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend {backend!r}")
+    if backend == "openai-oauth":
+        from graphify.oauth_responses import OAuthResponsesError
+
+        raise OAuthResponsesError("auxiliary_operation_unsupported")
     ollama_seed = _resolve_ollama_seed() if backend == "ollama" else None
     cfg = BACKENDS[backend]
     key = _get_backend_api_key(backend)
@@ -3508,11 +3633,13 @@ def _call_llm(
     return resp.choices[0].message.content or ""
 
 
-def estimate_cost(backend: str, input_tokens: int, output_tokens: int) -> float:
+def estimate_cost(backend: str, input_tokens: int, output_tokens: int) -> float | None:
     """Estimate USD cost for a given token count using published pricing."""
     if backend not in BACKENDS:
         return 0.0
     p = BACKENDS[backend]["pricing"]
+    if p is None:
+        return None  # Subscription usage is not an API-dollar estimate.
     return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000
 
 

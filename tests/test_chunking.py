@@ -535,10 +535,9 @@ def test_out_of_scope_nodes_are_dropped_from_merged_result(tmp_path, capsys):
     assert result["uncovered_files"] == []
 
 
-def test_edge_between_kept_nodes_survives_when_source_file_was_not_dispatched(tmp_path):
-    """#2276: a references edge between two re-extracted pages is kept when the
-    model stamps it with a real file this run did not dispatch, and a node
-    attributed to another undispatched file is still dropped."""
+def test_edge_between_kept_nodes_requires_dispatched_source_owner(tmp_path):
+    """Valid endpoints do not authorize a relation attributed outside the input.
+    Its prior valid counterpart must still survive the partial refresh."""
     from graphify.build import build, build_merge
     from graphify.cache import scope_semantic_result
     from graphify.export import to_json
@@ -619,10 +618,11 @@ def test_edge_between_kept_nodes_survives_when_source_file_was_not_dispatched(tm
     assert all(n.get("id") != "stray" for n in result["nodes"])
 
     scope_semantic_result(result, tmp_path, [page_a, page_b])
-    assert any(
+    assert not any(
         e.get("source") == "page_a" and e.get("target") == "page_b"
         for e in result["edges"]
-    ), f"page_a→page_b missing after scope: {result['edges']}"
+    ), f"out-of-scope relation survived: {result['edges']}"
+    assert set(result["_partial_files"]) == {str(page_a), str(page_b)}
 
     G = build_merge([result], graph_path, root=tmp_path)
     assert G.has_edge("page_a", "page_b")

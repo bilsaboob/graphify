@@ -2380,3 +2380,207 @@ def test_who_calls_question_reaches_a_caller_in_another_repo():
     text = _query_graph_text(_make_two_repo_graph(), "who calls charge", mode="bfs", depth=1, token_budget=2000)
     assert "Context: call (heuristic)" in text
     assert "Checkout" in text
+
+
+def _documentation_graph():
+    G = nx.DiGraph()
+    G.add_node("doc", label="Session payload", file_type="document", node_kind="doc_concept",
+               source_file="docs/session.md", source_location="L3", attributes={
+                   "aliases": ["login envelope"],
+                   "code_candidates": [{"target_id": f"candidate_{i}", "reason": "same label"}
+                                       for i in range(30)],
+                   "code_hints": [{"text": "buildSession", "source_location": "L8"}],
+                   "code_resolution": {"ambiguous": 1, "unresolved": 1},
+                   "section": "Session handoff",
+                   "summary": "Login writes the payload used at startup.",
+               })
+    for nid, source, loc in (("api", "src/api.py", "L10"), ("worker", "src/worker.py", "L40")):
+        G.add_node(nid, label="buildSession", file_type="code", source_file=source, source_location=loc)
+        G.add_edge("doc", nid, relation="references", confidence="AMBIGUOUS", confidence_score=0.5,
+                   context="producer", source_file="docs/session.md", source_location="L8",
+                   match_reason='name matches "buildSession"', _generated_by="markdown-advisory-v1")
+    G.add_node("caller", label="LoginHandler", file_type="code", source_file="src/login.py",
+               source_location="L2")
+    G.add_edge("caller", "api", relation="calls", confidence="EXTRACTED", context="call",
+               source_file="src/login.py", source_location="L9")
+    return G
+
+
+def test_advisory_edges_keep_reference_site_and_disambiguate_actual_targets():
+    G = _documentation_graph()
+    text = _subgraph_to_text(G, set(G), list(G.edges()))
+    edges = [line for line in text.splitlines() if line.startswith("EDGE Session payload")]
+    assert len(edges) == 2
+    for line, location in zip(edges, ("src/api.py:L10", "src/worker.py:L40")):
+        assert "--references [AMBIGUOUS context=producer]--> buildSession" in line
+        assert "at=docs/session.md:L8" in line
+        assert f'target="{location}"' in line
+        assert 'match_reason="name matches \\"buildSession\\""' in line
+    assert ('EDGE LoginHandler --calls [EXTRACTED context=call]--> buildSession '
+            'at=src/login.py:L9') in text.splitlines()
+
+
+def test_advisory_target_uses_stored_direction_not_traversal_order():
+    G = _documentation_graph().to_undirected()
+    G.edges["doc", "api"].update(_src="doc", _tgt="api")
+    text = _subgraph_to_text(G, {"doc", "api"}, [("api", "doc")])
+    assert 'target="src/api.py:L10"' in text
+    assert 'target="docs/session.md:L3"' not in text
+
+
+def test_advisory_neighbors_show_incoming_neighbor_and_outgoing_target_locations():
+    G = _documentation_graph()
+    outgoing = _neighbor_lines(G, "doc", "references")
+    assert len(outgoing) == 2
+    assert all("context=producer" in line and "at=docs/session.md:L8" in line for line in outgoing)
+    assert any('target="src/api.py:L10"' in line for line in outgoing)
+    assert any('target="src/worker.py:L40"' in line for line in outgoing)
+    incoming = _neighbor_lines(G, "api", "references")
+    assert len(incoming) == 1
+    assert '  <-- Session payload [references] [AMBIGUOUS 0.50]' in incoming[0]
+    assert 'target="src/api.py:L10"' in incoming[0]
+    assert 'neighbor="docs/session.md:L3"' in incoming[0]
+
+
+def test_advisory_suffix_uses_direct_node_lookups_for_same_label_documents(monkeypatch):
+    G = _documentation_graph()
+    G.add_node("other_doc", label="Session payload", source_file="docs/startup.md", source_location="L20")
+    G.add_edge("doc", "other_doc", relation="conceptually_related_to", confidence="INFERRED",
+               context="documentation", _generated_by="markdown-advisory-v1")
+
+    class IndexedNodes(dict):
+        def __iter__(self):
+            pytest.fail("neighbor formatting must not scan all nodes per edge")
+
+    monkeypatch.setattr(G, "nodes", IndexedNodes(G.nodes))
+    line, = _neighbor_lines(G, "doc", "conceptually_related_to")
+    assert 'context=documentation target="docs/startup.md:L20"' in line
+    assert "match_reason=" not in line
+
+
+@pytest.mark.parametrize("context", ["documentation", "example", "producer", "consumer"])
+def test_documentary_references_do_not_enter_call_context(context):
+    G = _documentation_graph()
+    for target in ("api", "worker"):
+        G.edges["doc", target]["context"] = context
+    assert set(_filter_graph_by_context(G, ["call"]).edges()) == {("caller", "api")}
+    text = _query_graph_text(G, "src/api.py::buildSession", context_filters=["call"])
+    assert "--calls " in text
+    assert "--references " not in text and "Session payload" not in text
+
+
+def test_document_aliases_are_searchable_and_compact_summary_survives_candidate_metadata():
+    from copy import deepcopy
+    from graphify.serve import _node_attributes_json
+
+    G = _documentation_graph()
+    original = deepcopy(G.nodes["doc"])
+    text = _query_graph_text(G, "login envelope", demote_docs=False)
+    line = next(line for line in text.splitlines() if line.startswith("NODE Session payload"))
+    assert 'attrs={summary="Login writes the payload used at startup."' in line
+    assert "..." in line
+    assert len(line.split("attrs={", 1)[1][:-2]) <= 200
+    attrs = _node_attributes_json(G.nodes["doc"])
+    assert attrs.startswith('{"summary": "Login writes the payload used at startup."')
+    assert len(attrs) == 1000 and attrs.endswith("...")
+    assert G.nodes["doc"] == original
+
+
+def test_example_preview_precedes_verbose_candidates_within_existing_attribute_limits():
+    from graphify.serve import _node_attributes_json
+
+    G = _documentation_graph()
+    G.nodes["doc"].update(node_kind="code_example")
+    G.nodes["doc"]["attributes"].update(preview="buildSession(user)", language="python")
+    line = _subgraph_to_text(G, {"doc"}, [])
+    assert 'attrs={preview="buildSession(user)", language="python"' in line
+    assert _node_attributes_json(G.nodes["doc"]).startswith('{"preview": "buildSession(user)"')
+
+
+def test_non_document_attribute_order_and_native_format_are_unchanged():
+    from graphify.serve import _node_attributes_json
+
+    G = nx.DiGraph()
+    attrs = {"summary": "last", "alpha": {"z": 3, "a": True}, "beta": None}
+    G.add_node("a", label="A", source_file="a.py", source_location="L1", attributes=attrs)
+    G.add_node("b", label="B", source_file="b.py", source_location="L2")
+    G.add_edge("a", "b", relation="calls", confidence="EXTRACTED",
+               source_file="a.py", source_location="L3")
+    assert _node_attributes_json(G.nodes["a"]) == json.dumps(attrs, sort_keys=True)
+    assert _subgraph_to_text(G, {"a"}, []) == (
+        'NODE A [src=a.py loc=L1 community= attrs={alpha={"a": true, "z": 3}, beta=null, summary="last"}]'
+    )
+    assert _neighbor_lines(G, "a") == ['  --> B [calls] [EXTRACTED] at=a.py:L3']
+
+
+def test_enrichment_values_are_redacted_and_sanitized_before_clipping():
+    from graphify.serve import _edge_display_suffix, _node_attributes_json
+
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    edge = {"match_reason": '"quoted"\n\x1b' + "x " * 45 + secret + " y" * 100,
+            "context": "example\n\x1b", "_generated_by": "markdown-advisory-v1"}
+    suffix = _edge_display_suffix(edge, {"source_file": 'src/"api".py', "source_location": "L5\n"})
+    assert secret not in suffix and "ghp_" not in suffix
+    assert "\n" not in suffix and "\x1b" not in suffix
+    assert 'target="src/\\"api\\".py:L5"' in suffix and "..." in suffix
+    assert "match_reason=" in suffix and 'context=example' in suffix
+    assert len(suffix) < 250
+    G = nx.DiGraph()
+    G.add_node("doc", label="Setup", file_type="document", attributes={
+        "summary": '"quoted"\n\x1b' + "x " * 15 + secret + " trailing" * 100,
+        "preview": {"nested": secret + "\x1b"},
+    })
+    text = _subgraph_to_text(G, {"doc"}, [])
+    attrs = _node_attributes_json(G.nodes["doc"])
+    for output in (text, attrs):
+        assert "ghp_" not in output and "\x1b" not in output
+        assert "[redacted]" in output and "..." in output
+    assert G.nodes["doc"]["attributes"]["preview"]["nested"].startswith(secret)
+
+
+def test_advisory_suffix_is_accounted_for_by_existing_query_and_neighbor_budgets():
+    G = _documentation_graph()
+    bare = G.copy()
+    for _, _, data in bare.edges(data=True):
+        data.pop("_generated_by", None)
+        data.pop("match_reason", None)
+    plain = _subgraph_to_text(bare, set(bare), list(bare.edges()))
+    budget = (len(plain) + 2) // 3
+    assert "over budget" not in _subgraph_to_text(bare, set(bare), list(bare.edges()), budget)
+    rich = _subgraph_to_text(G, set(G), list(G.edges()), budget)
+    assert "Complete answer over budget" in rich
+    assert rich.count("match_reason=") == 2
+    assert "truncated" in _cut_lines_to_budget(_neighbor_lines(G, "doc"), 20, "Use relation_filter")
+
+
+def test_get_node_uses_bounded_document_attributes_and_neighbors_share_edge_suffix(tmp_path):
+    from tests.test_serve_http import _call_tool, _client, _init_session
+    from graphify.serve import _build_http_app, _edge_display_suffix
+
+    G = _documentation_graph()
+    path = tmp_path / "graph.json"
+    path.write_text(json.dumps(json_graph.node_link_data(G, edges="links")), encoding="utf-8")
+    with _client(_build_http_app(str(path), json_response=True)) as client:
+        headers = _init_session(client)
+        node = _call_tool(client, headers, "get_node", {"node_id": "doc"}, rid=2)
+        neighbors = _call_tool(client, headers, "get_neighbors", {"node_id": "api"}, rid=3)
+    assert node.startswith("Node: Session payload\n")
+    assert 'Attributes: {"summary": "Login writes the payload used at startup."' in node
+    assert len(node.split("Attributes: ", 1)[1]) <= 1000
+    assert _edge_display_suffix(G.edges["doc", "api"], G.nodes["api"], neighbor=G.nodes["doc"]) in neighbors
+
+
+def test_cli_explain_reuses_attribute_and_edge_helpers(monkeypatch, capsys, tmp_path):
+    from graphify import cli, querylog, reflect, serve
+
+    G = _documentation_graph()
+    monkeypatch.setattr(sys, "argv", ["graphify", "explain", "api", "--graph", str(tmp_path / "graph.json")])
+    monkeypatch.setattr(cli, "_load_cli_graph", lambda _: G)
+    monkeypatch.setattr(cli, "_touch_query_stamp", lambda _: None)
+    monkeypatch.setattr(querylog, "log_query", lambda **_: None)
+    monkeypatch.setattr(reflect, "load_learning_overlay", lambda _: {})
+    monkeypatch.setattr(serve, "_node_attributes_json", lambda _: "shared-attributes")
+    cli.dispatch_command("explain")
+    output = capsys.readouterr().out
+    assert "shared-attributes" in output
+    assert serve._edge_display_suffix(G.edges["doc", "api"], G.nodes["api"], neighbor=G.nodes["doc"]) in output

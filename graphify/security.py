@@ -1,6 +1,7 @@
 # Security helpers - URL validation, safe fetch, path guards, label sanitisation
 from __future__ import annotations
 
+import hashlib
 import html
 import http.client
 import os
@@ -8,8 +9,12 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
+from array import array
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import ipaddress
@@ -434,6 +439,17 @@ _SECRET_SHAPE_RE = re.compile(
 )
 
 REDACTED_MARKER = "[redacted]"
+SOURCE_REDACTION_POLICY = "credential-shapes-preserve-coordinates-v1"
+SOURCE_REDACTION_MASKS = MappingProxyType({1: "*", 2: "\u00a4", 3: "\u2588", 4: "\U0001f7e5"})
+SOURCE_REDACTION_REGEX_MASKS = MappingProxyType({**SOURCE_REDACTION_MASKS, 1: "x"})
+
+# Match the source-only framework analyzer's admission and traversal limits.
+_SOURCE_REDACTION_MAX_BYTES = 256 * 1024
+_SOURCE_REDACTION_MAX_NODES = 100_000
+_SOURCE_REDACTION_MAX_DEPTH = 256
+_SOURCE_REDACTION_MAX_RANGES = 4096
+_SOURCE_REDACTION_MAX_SCAN_BYTES = 16 * 1024 * 1024
+_SOURCE_REDACTION_PARSE_TIMEOUT_MICROS = 1_000_000
 
 
 def redact_secrets(text: str | None) -> str:
@@ -446,6 +462,202 @@ def redact_secrets(text: str | None) -> str:
     if not text:
         return "" if text is None else text
     return _SECRET_SHAPE_RE.sub(REDACTED_MARKER, str(text))
+
+
+def redact_source_credentials(source: str, language: str) -> tuple[str, dict | None]:
+    """Mask credential shapes in TS/TSX data without moving source coordinates.
+
+    Unsupported containment or syntax is refused, never repaired. Metadata has
+    half-open byte spans and one-based inclusive lines; the original file hash
+    is a freshness/provenance witness, not proof of authenticity. No source or
+    per-credential digest is retained in metadata.
+    """
+    def refusal(line: int = 1) -> ValueError:
+        return ValueError(f"Cannot safely redact source credentials at line {line}")
+
+    if not isinstance(source, str) or language not in ("typescript", "tsx"):
+        raise refusal()
+    first = _SECRET_SHAPE_RE.search(source)
+    if first is None:
+        return source, None
+    first_line = source.count("\n", 0, first.start()) + 1
+    if len(source) > _SOURCE_REDACTION_MAX_BYTES:
+        raise refusal(first_line)
+    try:
+        raw = source.encode("utf-8")
+        original_utf16 = len(source.encode("utf-16-le")) // 2
+    except UnicodeError:
+        raise refusal(first_line) from None
+    if len(raw) > _SOURCE_REDACTION_MAX_BYTES:
+        raise refusal(first_line)
+
+    offsets = array("I", [0])
+    for char in source:
+        offsets.append(offsets[-1] + len(char.encode("utf-8")))
+    line_starts = [0, *(index + 1 for index, byte in enumerate(raw) if byte == 10)]
+    matches = []
+    for match in _SECRET_SHAPE_RE.finditer(source):
+        if len(matches) >= _SOURCE_REDACTION_MAX_RANGES:
+            raise refusal(bisect_right(line_starts, offsets[match.start()]))
+        matches.append((offsets[match.start()], offsets[match.end()]))
+
+    try:
+        from tree_sitter import Language, Parser
+        import tree_sitter_typescript
+
+        factory = (
+            tree_sitter_typescript.language_tsx
+            if language == "tsx"
+            else tree_sitter_typescript.language_typescript
+        )
+        grammar = Language(factory())
+    except Exception:
+        raise refusal(first_line) from None
+
+    def syntax(data: bytes) -> tuple[list, list, list, set]:
+        try:
+            # The 0.25 runtime's progress callback can crash on nested input on
+            # Windows. Its native timeout safely bounds direct bytes parsing.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message=r"Use the progress_callback in parse\(\)",
+                    category=DeprecationWarning,
+                )
+                parser = Parser(grammar, timeout_micros=_SOURCE_REDACTION_PARSE_TIMEOUT_MICROS)
+            tree = parser.parse(data)
+        except Exception:
+            raise refusal(first_line) from None
+        if tree is None:
+            raise refusal(first_line)
+        if tree.root_node.has_error:
+            raise refusal(first_line)
+
+        regions, escapes, structure, regex_regions = [], [], [], []
+        pending = [(tree.root_node, 0, False)]
+        count = 0
+        while pending:
+            node, depth, opaque = pending.pop()
+            count += 1
+            if count > _SOURCE_REDACTION_MAX_NODES or depth > _SOURCE_REDACTION_MAX_DEPTH:
+                raise refusal(node.start_point.row + 1)
+            kind, start, end = node.type, node.start_byte, node.end_byte
+            if not opaque:
+                structure.append((kind, start, end))
+            if kind == "escape_sequence":
+                escapes.append((start, end))
+            # TypeScript also uses an anonymous `string` token for type syntax.
+            if kind in {"string", "template_string"} and node.is_named:
+                quote = data[start:start + 1]
+                if quote not in (b"'", b'"', b"`") or data[end - 1:end] != quote:
+                    raise refusal(node.start_point.row + 1)
+                cursor = start + 1
+                if kind == "template_string":
+                    for child in node.children:
+                        if child.type == "template_substitution":
+                            regions.append((cursor, child.start_byte))
+                            cursor = child.end_byte
+                regions.append((cursor, end - 1))
+            elif kind == "comment":
+                if data[start:start + 2] == b"//":
+                    regions.append((start + 2, end))
+                elif data[start:start + 2] == b"/*" and data[end - 2:end] == b"*/":
+                    regions.append((start + 2, end - 2))
+                else:
+                    raise refusal(node.start_point.row + 1)
+            elif kind == "jsx_text":
+                regions.append((start, end))
+            elif kind == "regex_pattern":
+                regions.append((start, end))
+                regex_regions.append((start, end))
+            for child in reversed(node.children):
+                child_opaque = opaque or kind in {"string", "comment", "jsx_text", "regex_pattern"} or (
+                    kind == "template_string" and child.type in {"string_fragment", "escape_sequence"}
+                )
+                pending.append((child, depth + 1, child_opaque))
+        return sorted(regions), sorted(escapes), structure, set(regex_regions)
+
+    regions, escapes, structure, regex_regions = syntax(raw)
+    region_starts = [start for start, _ in regions]
+    # Tests and validators often repeat the detected userinfo as a plain
+    # expected string. Mask those identical data occurrences too, but never
+    # rewrite coincidentally equal code/identifier text.
+    seeds = {raw[start:end] for start, end in matches if raw[start:end] != b":"}
+    if len(raw) * len(seeds) > _SOURCE_REDACTION_MAX_SCAN_BYTES:
+        raise refusal(first_line)
+    expanded_matches = set(matches)
+    for seed in seeds:
+        cursor = 0
+        while (position := raw.find(seed, cursor)) >= 0:
+            end = position + len(seed)
+            region = bisect_right(region_starts, position) - 1
+            if region >= 0 and end <= regions[region][1]:
+                expanded_matches.add((position, end))
+                if len(expanded_matches) > _SOURCE_REDACTION_MAX_RANGES:
+                    raise refusal(bisect_right(line_starts, position))
+            cursor = end
+    matches = sorted(expanded_matches)
+    escape_ends = [end for _, end in escapes]
+    ranges = []
+    for start, end in matches:
+        line = bisect_right(line_starts, start)
+        region = bisect_right(region_starts, start) - 1
+        if region < 0 or end > regions[region][1]:
+            raise refusal(line)
+        if regions[region] in regex_regions:
+            # Partial replacement can unbalance a pattern. Replace the entire
+            # literal pattern with non-special characters, retaining delimiters
+            # and flags; its original matching semantics are unavailable.
+            start, end = regions[region]
+        # Removing only part of an escape can leave an invalid backslash prefix.
+        index = bisect_right(escape_ends, start)
+        while index < len(escapes) and escapes[index][0] < end:
+            start = min(start, escapes[index][0])
+            end = max(end, escapes[index][1])
+            index += 1
+        if start < regions[region][0] or end > regions[region][1]:
+            raise refusal(line)
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(end, ranges[-1][1]))
+        else:
+            ranges.append((start, end))
+
+    chunks, metadata_ranges = [], []
+    cursor = 0
+    for start, end in ranges:
+        first_char, last_char = bisect_left(offsets, start), bisect_left(offsets, end)
+        if offsets[first_char] != start or offsets[last_char] != end:
+            raise refusal(bisect_right(line_starts, start))
+        chunks.append(source[cursor:first_char])
+        masks = SOURCE_REDACTION_REGEX_MASKS if (start, end) in regex_regions else SOURCE_REDACTION_MASKS
+        chunks.append("".join(
+            char if char in "\r\n" else masks[len(char.encode("utf-8"))]
+            for char in source[first_char:last_char]
+        ))
+        cursor = last_char
+        metadata_ranges.append({
+            "startByte": start,
+            "endByte": end,
+            "startLine": bisect_right(line_starts, start),
+            "endLine": bisect_right(line_starts, end - 1),
+        })
+    chunks.append(source[cursor:])
+    masked = "".join(chunks)
+    masked_raw = masked.encode("utf-8")
+    if (
+        len(masked_raw) != len(raw)
+        or len(masked.encode("utf-16-le")) // 2 != original_utf16
+        or redact_secrets(masked) != masked
+    ):
+        raise refusal(first_line)
+    # Also catch a mask creating syntax, e.g. '*' before '/' inside a comment.
+    if syntax(masked_raw)[2] != structure:
+        raise refusal(first_line)
+    return masked, {
+        "version": 1,
+        "policy": SOURCE_REDACTION_POLICY,
+        "originalSourceHash": hashlib.sha256(raw).hexdigest(),
+        "ranges": metadata_ranges,
+    }
 
 
 def sanitize_label(text: str | None) -> str:

@@ -673,6 +673,42 @@ def test_python_receiver_shadow_schema_retires_same_version_raw_calls(
     ]
 
 
+def test_dynamic_import_schema_retires_source_owned_stubs_without_semantic_loss(tmp_path, monkeypatch):
+    import graphify.cache as cache_mod
+    from graphify.extract import extract_js
+
+    current_schema = cache_mod._AST_CACHE_SCHEMA
+    importer = tmp_path / "caller.js"
+    importer.write_text("export const later = import('example-package');\n", encoding="utf-8")
+    document = tmp_path / "doc.md"
+    document.write_text("# Cached document\n", encoding="utf-8")
+    monkeypatch.setattr(cache_mod, "_EXTRACTOR_VERSION", "same-version")
+    monkeypatch.setattr(cache_mod, "_AST_CACHE_SCHEMA", 51)
+    monkeypatch.setattr(cache_mod, "_cleaned_ast_dirs", set())
+    save_cached(importer, {"nodes": [{
+        "id": "example_package", "label": "example-package", "type": "module",
+        "file_type": "code", "source_file": "example-package",
+    }], "edges": []}, root=tmp_path, kind="ast")
+    assert load_cached(importer, root=tmp_path, kind="ast") is not None
+    save_cached(document, {"nodes": [{"id": "preserved_semantic", "source_file": "doc.md"}], "edges": []},
+                root=tmp_path, kind="semantic")
+    semantic_before = load_cached(document, root=tmp_path, kind="semantic")
+    semantic_dir = cache_dir(tmp_path, "semantic")
+    semantic_bytes = {path.name: path.read_bytes() for path in semantic_dir.glob("*.json")}
+    assert semantic_before is not None and semantic_bytes
+
+    monkeypatch.setattr(cache_mod, "_AST_CACHE_SCHEMA", current_schema)
+    assert load_cached(importer, root=tmp_path, kind="ast") is None
+    # extract() bypasses JS AST caching; exercise the cache API with fresh output.
+    save_cached(importer, extract_js(importer), root=tmp_path, kind="ast")
+    fresh = load_cached(importer, root=tmp_path, kind="ast")
+    assert fresh is not None
+    stub, = [node for node in fresh["nodes"] if node.get("label") == "example-package"]
+    assert stub["type"] == "external" and stub["external"] is True and stub["source_file"] == ""
+    assert load_cached(document, root=tmp_path, kind="semantic") == semantic_before
+    assert {path.name: path.read_bytes() for path in semantic_dir.glob("*.json")} == semantic_bytes
+
+
 def test_ast_cache_version_bump_cleans_stale_entries(tmp_path, monkeypatch):
     """Upgrading removes AST entries left behind by previous versions so the
     cache directory does not grow one full copy per release."""
@@ -725,7 +761,7 @@ def test_semantic_cache_survives_version_bump(tmp_path, monkeypatch):
     f.write_text("# Title\n\nBody.\n")
 
     monkeypatch.setattr(cache_mod, "_EXTRACTOR_VERSION", "0.8.0", raising=False)
-    save_cached(f, {"nodes": [{"id": "n1"}], "edges": []}, root=tmp_path, kind="semantic")
+    save_cached(f, {"nodes": [{"id": "n1", "source_file": "doc.md"}], "edges": []}, root=tmp_path, kind="semantic")
     semantic_dir = cache_dir(tmp_path, "semantic")
 
     monkeypatch.setattr(cache_mod, "_EXTRACTOR_VERSION", "0.8.1", raising=False)
@@ -1970,8 +2006,7 @@ def test_existing_hyperedge_only_cache_entry_remains_hit(tmp_path):
 # applies the same allowlist to the result dict before it reaches the merge.
 
 def test_scope_semantic_result_drops_out_of_scope_groups(tmp_path):
-    """Stray items attributed to a non-dispatched file are removed; allowed
-    and source-less items pass through."""
+    """Stray and unowned items are removed; only allowed owners pass through."""
     from graphify.cache import scope_semantic_result
 
     result = {
@@ -1979,7 +2014,7 @@ def test_scope_semantic_result_drops_out_of_scope_groups(tmp_path):
             {"id": "kept", "source_file": "intended.md"},
             {"id": "stray", "source_file": "protected.md"},
             {"id": "phantom", "source_file": "src/foo.ts"},  # nonexistent path
-            {"id": "no_source"},  # no source_file: passes through
+            {"id": "no_source"},
         ],
         "edges": [
             {"source": "kept", "target": "other", "source_file": "intended.md"},
@@ -1995,11 +2030,12 @@ def test_scope_semantic_result_drops_out_of_scope_groups(tmp_path):
         result, root=tmp_path, allowed_source_files=["intended.md"],
     )
 
-    assert [n["id"] for n in result["nodes"]] == ["kept", "no_source"]
+    assert [n["id"] for n in result["nodes"]] == ["kept"]
     assert [e["source"] for e in result["edges"]] == ["kept"]
     assert [h["id"] for h in result["hyperedges"]] == ["h_kept"]
     assert dropped_files == {"protected.md", "src/foo.ts"}
-    assert dropped_items == 4  # 2 stray nodes + 1 stray edge + 1 stray hyperedge
+    assert dropped_items == 5  # 3 stray/unowned nodes + 1 stray edge + 1 stray hyperedge
+    assert result["_partial_files"] == ["intended.md"]
 
 
 def test_scope_semantic_result_matches_absolute_and_relative_forms(tmp_path):

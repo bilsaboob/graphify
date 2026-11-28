@@ -1,0 +1,12 @@
+{
+  "name": "graphify-local-scripts",
+  "private": true,
+  "scripts": {
+    "setup": "bun scripts/funtasia.ts setup",
+    "index": "bun scripts/funtasia.ts index",
+    "index:docs": "bun scripts/funtasia.ts index:docs",
+    "reindex": "bun scripts/funtasia.ts reindex",
+    "queries": "bun scripts/funtasia.ts queries",
+    "reset": "bun scripts/funtasia.ts reset"
+  }
+}

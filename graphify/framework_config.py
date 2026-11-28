@@ -1,9 +1,9 @@
 """Closed, bounded configuration for Graphify-owned source annotation.
 
-Alias targets come from the same packaged catalog bundled into the Node worker.
+Alias targets come from the packaged catalog shared with the reference analyzer.
 The catalog is read once at import, not during graph queries or source analysis.
 Mappings declare API identity only, not package contents or runtime equivalence.
-Overlapping source prefixes are retained: Node applies the longest slash-boundary
+Overlapping source prefixes are retained: the view applies the longest slash-boundary
 prefix exactly once. This module never resolves imports or rewrites source text.
 """
 

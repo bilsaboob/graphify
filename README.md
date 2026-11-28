@@ -158,11 +158,12 @@ Reach for the graph when you need to understand a codebase, not just read throug
 
 ## TypeScript framework evidence (v8-zen)
 
-This branch adds a deterministic, Graphify-owned TypeScript/TSX analysis lane.
-It uses Graphify's Tree-sitter parser and a bundled Node.js analyzer. It does not
-import or run Zen, the indexed application, or the indexed framework libraries.
-There are no runtime npm dependencies or model calls in this lane. Node.js 20 or
-newer must be available on `PATH`; extraction never installs it automatically.
+This branch adds deterministic, Graphify-owned TypeScript/TSX annotation plugins.
+They run inside the normal per-file extraction workers against the existing native
+Tree-sitter parse and sanitized source snapshot. No whole syntax tree is encoded,
+transported to Node, or reconstructed in another runtime. They do not import or
+run Zen, the indexed application, or the indexed framework libraries. There are
+no Node/npm dependencies or model calls in the indexing path.
 
 The parity target is the reviewed **source-only** library contracts, not a full
 TypeScript compiler `Program`, runtime tracing, or Zen's Concept registry and
@@ -192,17 +193,25 @@ In particular, a field called with `undefined` is not automatically a write,
 borrowed fields do not acquire disposal ownership, and registration is not
 callback execution.
 
-### Build, index and retrieve
+### Plugins, index and retrieve
 
-The distributable includes `graphify/semantic_node/worker.mjs`. When changing its
-owned source, rebuild and qualify it from the repository root:
+`graphify/native_annotations` separates the shared source view and bounded emission
+runtime from individual rule modules. The structural extractor calls one generic
+hook; it contains no FST or Solid rules. Installed Python packages can expose a
+module through the `graphify.annotations` entry-point group. A plugin supplies a
+`DESCRIPTOR` (versioned vocabulary and supported languages) and
+`analyze(view, budget, emitter)`; optional `RETURN_CONTRACTS` declare reviewed
+import-bound result shapes. `ATOMIC = True` discards an incomplete producer's fact
+set. Up to 32 plugins share the bounded per-document work/fact budget. The current
+shared language view supports TypeScript and TSX. Plugins are
+trusted installed code, not a sandbox or executable configuration loaded from
+the indexed project. Their implementation and configuration participate in the
+evidence fingerprint and incremental invalidation.
 
-```sh
-npm ci --prefix graphify/semantic_node
-npm run build --prefix graphify/semantic_node
-npm run typecheck --prefix graphify/semantic_node
-npm test --prefix graphify/semantic_node
-```
+The former `semantic_node` implementation remains a development comparison
+oracle for existing contract fixtures; normal indexing does not invoke it.
+Grammar-repaired structural parses are not presented as exact evidence: those
+exceptional files get an exact-source parse in the same worker.
 
 Indexing automatically includes the lane for admitted `.ts`, `.tsx`, `.mts` and
 `.cts` sources. `--code-only` skips document/model extraction, not deterministic
@@ -249,8 +258,17 @@ It preserves declarations, every role/property/relation occurrence, complete
 wire records, manifests and exact source snapshots. It does not pass these
 records through graph-edge deduplication or display metadata truncation. This
 also means graph artifacts contain source text and must be treated as sensitive
-project data. Credential-shaped content is rejected, not rewritten while still
-claiming its original source hash.
+project data. Credential-shaped values inside supported TypeScript literals and
+comments are masked in memory before parsing or retention. Original files are
+never rewritten. The mask preserves UTF-8 byte offsets, UTF-16 positions and line
+breaks; the indexed text has its own hash and an explicit redaction record with
+the original file hash and affected ranges. Retrieval labels this as a redacted
+view, not exact original literal values. Unsafe cases that would change code
+structure are still refused, and the credential detector remains a heuristic,
+not a guarantee that every possible secret can be recognized.
+Identical detected credential text in other literals/comments is also masked.
+A credential-bearing regex literal is masked as a whole pattern, preserving its
+delimiters and flags but explicitly not its original matching semantics.
 
 Source changes, explicit deletions, producer/parser changes and applicable
 configuration changes invalidate affected evidence. Failed/partial replacement
@@ -258,9 +276,9 @@ does not silently turn a retained good snapshot into current complete evidence.
 Exact references become stale rather than following similarly named symbols.
 The lane retains current and last-complete evidence, not an append-only history.
 
-Current protocol bounds include 256 KiB source per document, 16 documents and
-1 MiB source per request, 100,000 syntax nodes per document, 250,000 per request,
-16 MiB request/32 MiB response, and per-document declaration/fact/work budgets.
+Native extraction retains the 256 KiB source limit and per-document
+syntax/declaration/fact/work budgets, plus aggregate evidence-store limits.
+The former Node request and batch limits do not constrain the native path.
 Limits and truncation are explicit. Unsupported cross-repository composition is
 rejected rather than silently merging colliding corpus-local evidence identities.
 

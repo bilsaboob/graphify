@@ -384,6 +384,38 @@ def _with_hint(nudge: str, terms: "list[str] | None" = None, rel_file: "str | No
         return nudge
 
 
+def _scope_cached_semantics(data: dict, root: Path, allowed_sources) -> tuple[int, int]:
+    """Revalidate a retained CLI graph's semantic lane, not its AST/native data."""
+    from graphify.build import _is_ast_tier
+    from graphify.cache import scope_semantic_result
+
+    edge_key = "links" if "links" in data else "edges"
+    hyperedges = data.get("hyperedges")
+    if not isinstance(hyperedges, list):
+        hyperedges = (data.get("graph") or {}).get("hyperedges", [])
+    original = {"nodes": data.get("nodes", []), "edges": data.get(edge_key, []), "hyperedges": hyperedges}
+    semantic = {
+        key: [row for row in rows if key == "hyperedges" or not _is_ast_tier(row)]
+        for key, rows in original.items()
+    }
+    if not scope_semantic_result(semantic, root, allowed_sources)[1]:
+        return 0, 0
+    for key, rows in original.items():
+        kept = {id(row) for row in semantic[key]}
+        data[key if key != "edges" else edge_key] = [
+            row for row in rows if id(row) in kept or (key != "hyperedges" and _is_ast_tier(row))
+        ]
+    kept_ids = {n.get("id") for n in data["nodes"]}
+    dropped_ids = {n.get("id") for n in original["nodes"]} - kept_ids
+    data[edge_key] = [e for e in data[edge_key] if e.get("source") not in dropped_ids and e.get("target") not in dropped_ids]
+    data["hyperedges"] = [h for h in data["hyperedges"] if not dropped_ids.intersection(h.get("nodes") or [])]
+    if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
+        data["graph"]["hyperedges"] = data["hyperedges"]
+    removed_nodes = len(original["nodes"]) - len(data["nodes"])
+    removed = removed_nodes + len(original["edges"]) - len(data[edge_key]) + len(original["hyperedges"]) - len(data["hyperedges"])
+    return removed_nodes, removed
+
+
 def _stamped_manifest_files(
     files_by_type: dict[str, list[str]],
     sem_result: dict,
@@ -1066,6 +1098,8 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
     data[links_key] = kept_edges
     if "hyperedges" in data:
         data["hyperedges"] = kept_hyper
+    from graphify.build import finalize_raw_graph_endpoints, _infer_merge_root
+    finalize_raw_graph_endpoints(data, root=_infer_merge_root(graph_path))
     from graphify.export import backup_if_protected as _backup
     _backup(graph_path.parent)
     from graphify.paths import write_json_atomic
@@ -2821,7 +2855,10 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) == 3 and sys.argv[2] in ("--help", "-h"):
             print(_explain_usage)
             return
-        from graphify.serve import _confidence_tag, _is_ambiguity_refusal, _resolve_single_node
+        from graphify.serve import (
+            _confidence_tag, _edge_display_suffix, _is_ambiguity_refusal,
+            _node_attributes_json, _resolve_single_node,
+        )
 
         label = sys.argv[2]
         graph_path = _default_graph_path()
@@ -2869,6 +2906,9 @@ def dispatch_command(cmd: str) -> None:
         except Exception:
             pass
         print(f"  Degree:    {G.degree(nid)}")
+        attributes = _node_attributes_json(d)
+        if attributes:
+            print(f"  Attributes: {attributes}")
         from graphify.build import edge_datas
         connections: list[tuple[str, str, dict]] = []  # (direction, neighbor_id, edge_data)
         # Classify by the edge's TRUE direction, not the loaded arc order:
@@ -2899,7 +2939,11 @@ def dispatch_command(cmd: str) -> None:
                 loc = edata.get("source_location") or ""
                 sfile = edata.get("source_file") or ""
                 at = f" {sfile}:{loc}" if loc else ""
-                print(f"  {arrow} {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]{at}")
+                suffix = _edge_display_suffix(
+                    edata, G.nodes[nb if direction == "out" else nid],
+                    neighbor=G.nodes[nb] if direction == "in" else None,
+                )
+                print(f"  {arrow} {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]{at}{suffix}")
             if len(connections) > len(shown):
                 remainder = connections[len(shown):]
                 print(f"  ... and {len(remainder)} more (--all lists all {len(connections)})")
@@ -4855,6 +4899,39 @@ def dispatch_command(cmd: str) -> None:
             code_files = list(dict.fromkeys([*code_files, *_framework_refresh]))
             print(f"[graphify extract] framework implementation/configuration changed: refreshing {len(_framework_refresh)} admitted source(s), no document LLM refresh")
 
+        _sanitized_baseline = None
+        _baseline_partial: set[str] = set()
+        _rejected_baseline_nodes = 0
+        if has_path and _existing_graph_snapshot is not None:
+            # Prior dispatch boundaries are not persisted in graph.json. If its
+            # semantic ownership is invalid, retain valid rows but do not claim
+            # complete coverage for any live semantic input on this repair run.
+            _baseline_scope = [p for paths in files_by_type.values() for p in paths]
+            _baseline_scope += list(detection.get("unclassified", [])) + deleted_files + excluded_files + graph_stale_sources
+            _rejected_baseline_nodes, _rejected_baseline_items = _scope_cached_semantics(
+                _existing_graph_snapshot, target, _baseline_scope,
+            )
+            if _rejected_baseline_items:
+                # A failed walk can omit valid owners. Its incomplete allowlist
+                # cannot authorize removals or discounts to the shrink guard.
+                if detection.get("walk_errors"):
+                    print(
+                        "[graphify extract] error: cannot repair cached semantic ownership after an incomplete source scan; "
+                        "refusing to overwrite the existing graph. Re-run after fixing walk errors.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                _sanitized_baseline = _existing_graph_snapshot
+                _baseline_partial = {str(p) for kind in ("document", "paper", "image") for p in files_by_type.get(kind, [])}
+                for node in _sanitized_baseline.get("nodes", []):
+                    if str(node.get("source_file", "")).lower().endswith(".md") and node.get("_origin") == "ast":
+                        node.setdefault("attributes", {})["semantic_coverage"] = "partial"
+                merge_existing_graph = True
+                print(
+                    f"[graphify extract] dropped {_rejected_baseline_items} cached semantic item(s) with invalid ownership; "
+                    "valid prior information retained, semantic coverage marked partial for retry.", file=sys.stderr,
+                )
+
         semantic_files = doc_files + paper_files + image_files
         # --code-only: index code (pure local AST, no key) and skip the semantic
         # (doc/paper/image) pass entirely, so a mixed repo doesn't hard-fail when no
@@ -5065,6 +5142,16 @@ def dispatch_command(cmd: str) -> None:
                         or os.environ.get("AWS_DEFAULT_REGION")
                         or os.environ.get("AWS_ACCESS_KEY_ID")
                     )
+                elif backend == "openai-oauth":
+                    from graphify.llm import _default_model_for_backend
+                    from graphify.oauth_responses import OAuthResponsesError, configuration
+
+                    try:
+                        configuration(model or _default_model_for_backend(backend))
+                    except OAuthResponsesError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        sys.exit(1)
+                    allow_no_key = True
                 elif backend == "claude-cli":
                     import shutil as _shutil
                     allow_no_key = _shutil.which("claude") is not None
@@ -5092,7 +5179,7 @@ def dispatch_command(cmd: str) -> None:
         # pass crashed, or some semantic chunks failed). A partial result must not
         # be force-written over a good complete graph — the final write falls back
         # to the #479 shrink guard unless --allow-partial is set.
-        _extraction_incomplete = False
+        _extraction_incomplete = _sanitized_baseline is not None
         # A walk that couldn't fully enumerate the corpus (permission-denied
         # subtree, I/O error) yields a legitimately smaller graph that must not
         # be force-written over a complete one — same failure class as a crashed
@@ -5107,10 +5194,12 @@ def dispatch_command(cmd: str) -> None:
                 [Path(p) for p in [*deleted_files, *excluded_files, *graph_stale_sources]],
             )
 
-        # AST extraction on code files. Empty code list (docs-only corpus) is
-        # the issue #698 case — skip cleanly instead of crashing inside extract().
+        # Keep Markdown structure alongside its semantic contribution. Code-only
+        # mode already removed these files from semantic_files above.
+        _structural_markdown = [p for p in semantic_files if p.suffix.lower() == ".md"]
+        _structural_files = list(dict.fromkeys(code_files + _structural_markdown))
         ast_result: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
-        if code_files or (incremental_mode and existing_graph_path.exists()):
+        if _structural_files or (incremental_mode and existing_graph_path.exists()):
             from graphify.extract import extract as _ast_extract
             # Anchor the cache at the output root, not the scanned project:
             # with --out, a <target>/graphify-out/cache/ would leak a
@@ -5288,9 +5377,10 @@ def dispatch_command(cmd: str) -> None:
                 if _ctx_edges:
                     ast_kwargs["resolution_context_edges"] = _ctx_edges
                 del _ctx_nodes, _ctx_edges
-            print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
+            _structural_files = list(dict.fromkeys(code_files + _structural_markdown))
+            print(f"[graphify extract] AST extraction on {len(code_files)} code files and {len(_structural_markdown)} Markdown files...")
             try:
-                ast_result = _ast_extract(code_files, **ast_kwargs) if code_files else ast_result
+                ast_result = _ast_extract(_structural_files, **ast_kwargs) if _structural_files else ast_result
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 from graphify.watch import _record_framework_failure
@@ -5303,7 +5393,7 @@ def dispatch_command(cmd: str) -> None:
                 if not cli_allow_partial:
                     sys.exit(1)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0,
-                              "failed_sources": [str(path) for path in code_files]}
+                              "failed_sources": [str(path) for path in _structural_files]}
                 _extraction_incomplete = True  # the whole AST pass was lost
             # Only extract() reads the resolution context; free it before the
             # semantic pass and graph build.
@@ -5327,7 +5417,7 @@ def dispatch_command(cmd: str) -> None:
         # unstamped in the manifest so detect_incremental re-queues them next run
         # (mirrors the #933 failed-chunk handling); captured below before the
         # _partial markers are stripped from the corpus.
-        _partial_semantic_files: set[str] = set()
+        _partial_semantic_files: set[str] = set(_baseline_partial)
         sem_cache_hits = 0
         sem_cache_misses = 0
         # Files served from the semantic cache this run (absolute paths), used
@@ -5344,6 +5434,14 @@ def dispatch_command(cmd: str) -> None:
         # the same prompt, or the write lands where the next read won't look.
         from graphify.llm import _extraction_system as _sem_prompt_for
         sem_prompt = _sem_prompt_for(deep=deep_mode)
+        if _baseline_partial:
+            # Old cache fragments can contain relations to a discarded node
+            # even when the unowned node itself was never cacheable.
+            from graphify.cache import mark_semantic_cache_partial
+            mark_semantic_cache_partial(
+                _baseline_partial, root=target, cache_root=out_root,
+                mode=sem_cache_mode, prompt=sem_prompt,
+            )
         if semantic_files:
             sem_paths_str = [str(p) for p in semantic_files]
             if force:
@@ -5406,13 +5504,17 @@ def dispatch_command(cmd: str) -> None:
                     )
                 except ImportError as exc:
                     print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(1)
+                    if not _structural_markdown:
+                        sys.exit(1)
+                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "uncovered_files": list(uncached_paths)}
+                    _extraction_incomplete = True
                 except Exception as exc:
                     print(
                         f"[graphify extract] semantic extraction failed: {exc}",
                         file=sys.stderr,
                     )
-                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0,
+                             "uncovered_files": list(uncached_paths)}
                     _extraction_incomplete = True  # the semantic pass crashed
 
                 # on_chunk_done only fires after a chunk succeeds. If fresh
@@ -5426,7 +5528,11 @@ def dispatch_command(cmd: str) -> None:
                         f"run `pip install X` and retry.",
                         file=sys.stderr,
                     )
-                    sys.exit(1)
+                    if not _structural_markdown:
+                        sys.exit(1)
+                    fresh.setdefault("uncovered_files", list(uncached_paths))
+                    _extraction_incomplete = True
+                    print("[graphify extract] keeping Markdown structure and prior semantic information; semantic coverage remains pending.", file=sys.stderr)
                 # Some (but not all) chunks failed — the graph is missing nodes
                 # from the failed chunks, so it must not clobber a larger complete
                 # graph without an explicit --allow-partial override.
@@ -5444,11 +5550,11 @@ def dispatch_command(cmd: str) -> None:
                 _dropped_files, _dropped_items = _scope_semantic_result(
                     fresh, target, uncached_paths,
                 )
-                if _dropped_files:
+                if _dropped_items:
                     print(
-                        f"[graphify extract] dropped {_dropped_items} out-of-scope "
-                        f"item(s) attributed to {len(_dropped_files)} file(s) not "
-                        f"dispatched this run: {', '.join(sorted(_dropped_files))}"
+                        f"[graphify extract] dropped {_dropped_items} semantic item(s) "
+                        "with malformed or out-of-scope source attribution"
+                        + (f": {', '.join(sorted(_dropped_files))}" if _dropped_files else "")
                     )
                 # Which files truncated this run (item markers + the empty-parse
                 # _partial_files set). Computed BEFORE the save so it can be passed
@@ -5458,8 +5564,10 @@ def dispatch_command(cmd: str) -> None:
                 from graphify.llm import (
                     _partial_source_files as _partial_sf,
                     _strip_partial_markers as _strip_partial,
+                    prepare_markdown_semantics,
                 )
-                _partial_semantic_files = set(_partial_sf(fresh))
+                prepare_markdown_semantics(fresh)
+                _partial_semantic_files.update(_partial_sf(fresh))
                 # A chunk that came back hollow after every retry, or as
                 # unparseable JSON, or that simply omitted some of its files,
                 # does not raise - it returns fewer nodes - so it counted as a
@@ -5470,6 +5578,7 @@ def dispatch_command(cmd: str) -> None:
                 # fraction of the graph, so it must arm the guard exactly like a
                 # crashed chunk does. --allow-partial still overrides.
                 _omitted_files = list(fresh.get("uncovered_files") or [])
+                _partial_semantic_files.update(str(p) for p in _omitted_files)
                 if _omitted_files or _partial_semantic_files:
                     _extraction_incomplete = True
                     _coverage_note = ""
@@ -5495,9 +5604,8 @@ def dispatch_command(cmd: str) -> None:
                     print(
                         f"[graphify extract] semantic extraction is incomplete: "
                         f"{len(_omitted_files)} dispatched file(s) produced no nodes and "
-                        f"{len(_partial_semantic_files)} came back truncated or hollow."
-                        f"{_coverage_note} The shrink guard stays armed for this write; "
-                        f"pass --allow-partial to overwrite a larger existing graph anyway.",
+                        f"{len(_partial_semantic_files)} have incomplete semantic coverage."
+                        f"{_coverage_note} Prior semantic information is retained for incomplete sources.",
                         file=sys.stderr,
                     )
                 try:
@@ -5600,7 +5708,25 @@ def dispatch_command(cmd: str) -> None:
         # incremental rebuild. Fresh results already carry the stamp
         # (llm._stamp_semantic_origin); cache entries from before it do not.
         from graphify.llm import _stamp_semantic_origin as _stamp_sem
+        from graphify.build import _norm_source_file as _doc_source_key, preserve_semantic_identities
         _stamp_sem(sem_result)
+        preserve_semantic_identities(ast_result, sem_result, root=target)
+        _semantic_present = {
+            _doc_source_key(str(n.get("source_file", "")), str(target))
+            for bucket in ("nodes", "hyperedges") for n in sem_result.get(bucket, []) if n.get("source_file")
+        }
+        _partial_semantic_files.update(
+            str(p) for p in semantic_files if _doc_source_key(str(p), str(target)) not in _semantic_present
+        )
+        _partial_keys = {_doc_source_key(str(p), str(target)) for p in _partial_semantic_files}
+        if _partial_keys and existing_graph_path.exists():
+            # Even a forced refresh retains prior knowledge for incomplete sources.
+            merge_existing_graph = True
+        for node in ast_result.get("nodes", []):
+            if Path(str(node.get("source_file", ""))).suffix.lower() == ".md":
+                node.setdefault("attributes", {})["semantic_coverage"] = (
+                    "partial" if _doc_source_key(str(node.get("source_file", "")), str(target)) in _partial_keys else "complete"
+                )
         merged: dict = {
             "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])) + list(cargo_result.get("nodes", [])),
             "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])) + list(cargo_result.get("edges", [])),
@@ -5609,14 +5735,16 @@ def dispatch_command(cmd: str) -> None:
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
             "extracted_sources": list(ast_result.get("extracted_sources", [])),
             "failed_sources": list(ast_result.get("failed_sources", [])),
+            "_partial_files": sorted(_partial_keys),
         }
         # Only the trusted source analyzer may populate this lane. LLM and
         # introspection payloads cannot claim typed source evidence.
         from graphify.framework_pipeline import evidence_from_data as _evidence_from_data
+        from graphify.framework_pipeline import evidence_is_complete as _evidence_is_complete
         _framework_evidence = _evidence_from_data(ast_result)
         if _framework_evidence is not None:
             merged["semantic_evidence"] = _framework_evidence
-        _framework_clean = _framework_complete(merged)
+        _framework_clean = _evidence_is_complete(_framework_evidence)
         if not _framework_clean:
             _extraction_incomplete = True
 
@@ -5706,7 +5834,7 @@ def dispatch_command(cmd: str) -> None:
         _stamped_semantic = {
             f for _flist in _manifest_files.values() for f in _flist
         }
-        _cleared_semantic = {str(p) for p in semantic_files} - _stamped_semantic
+        _cleared_semantic = ({str(p) for p in semantic_files} | _baseline_partial) - _stamped_semantic
         # #2543: AST failures need both hashes blanked (clear_ast), not just
         # semantic_hash — otherwise a prior bad stamp keeps the file "unchanged".
         _cleared_ast = set(_failed_ast_sources)
@@ -5751,6 +5879,7 @@ def dispatch_command(cmd: str) -> None:
                 and not code_files
                 and not semantic_files
                 and not deleted_files
+                and _sanitized_baseline is None
                 and not pg_result.get("nodes")
                 and not pg_result.get("edges")
                 and not cargo_result.get("nodes")
@@ -5802,6 +5931,7 @@ def dispatch_command(cmd: str) -> None:
                         graph_path=existing_graph_path,
                         prune_sources=_raw_prune_sources or None,
                         root=target,
+                        previous_data=_sanitized_baseline,
                     )
                 except RuntimeError as exc:
                     # Existing graph present but unparseable: refuse to
@@ -5828,7 +5958,10 @@ def dispatch_command(cmd: str) -> None:
                     _stamped_semantic = {
                         f for _flist in _manifest_files.values() for f in _flist
                     }
-                    _cleared_semantic = _shrink[2]
+                    _cleared_semantic = _shrink[2] | _baseline_partial
+            from graphify.markdown_resolution import DOCUMENTATION_EDGE_PRODUCER
+            merged["edges"] = [e for e in merged["edges"]
+                               if e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
             merged["nodes"] = _dedupe_nodes(merged["nodes"])
             merged["edges"] = _dedupe_edges(merged["edges"])
             merged["multigraph"] = _has_parallel_links(
@@ -5845,7 +5978,7 @@ def dispatch_command(cmd: str) -> None:
             # external module gets a typed stub node, and any other edge without
             # two declared endpoints is dropped instead of shipping a phantom.
             from graphify.build import finalize_raw_graph_endpoints as _finalize_raw_graph_endpoints
-            _finalize_raw_graph_endpoints(merged)
+            _finalize_raw_graph_endpoints(merged, root=target)
             # Backfill source_file from endpoint nodes — this raw path bypasses
             # build_from_json's backfill, and semantic edges sometimes omit it (#1279).
             _node_sf = {n.get("id"): n.get("source_file") for n in merged["nodes"]}
@@ -5862,6 +5995,8 @@ def dispatch_command(cmd: str) -> None:
             if _extraction_incomplete and not cli_allow_partial:
                 from graphify.export import MALFORMED_GRAPH as _MALFORMED_GRAPH
                 _existing_n = _existing_graph_node_count(graph_json_path)
+                if isinstance(_existing_n, int):
+                    _existing_n -= _rejected_baseline_nodes
                 _malformed = _existing_n is _MALFORMED_GRAPH
                 _shrinks = isinstance(_existing_n, int) and len(merged["nodes"]) < _existing_n
                 if _malformed or _shrinks:
@@ -5887,14 +6022,20 @@ def dispatch_command(cmd: str) -> None:
             # merge_raw_extraction above has consumed them; graph.json must not
             # carry this run's absolute input paths.
             from graphify.framework_pipeline import pack_raw_evidence
-            pack_raw_evidence(merged)
+            if not merge_existing_graph and _framework_evidence is not None and merged.get("semantic_evidence") is _framework_evidence and "graph" not in merged:
+                # This exact snapshot was validated above; the intervening graph
+                # finalizers change only nodes/edges, not source-owned evidence.
+                merged["graph"] = {"semantic_evidence": merged.pop("semantic_evidence")}
+                _packed_framework = _framework_evidence
+            else:
+                _packed_framework = pack_raw_evidence(merged)
             _write_json_atomic(
                 graph_json_path,
                 {k: v for k, v in merged.items() if k not in _RUN_ONLY_KEYS},
                 compact=True,
             )
             _stamp_framework_state(graphify_out, _framework_fingerprint,
-                                   complete=not _failed_ast_sources and _framework_complete(merged) and not _extraction_incomplete)
+                                   complete=not _failed_ast_sources and _evidence_is_complete(_packed_framework) and not _extraction_incomplete)
             try:
                 # Record the scan root so a later build_merge / update runbook can
                 # relativize deleted-file paths correctly even for a custom --out
@@ -5914,7 +6055,9 @@ def dispatch_command(cmd: str) -> None:
                 f"{len(merged['nodes'])} nodes, {len(merged['edges'])} edges "
                 f"(no clustering)"
             )
-            if merged["input_tokens"] or merged["output_tokens"]:
+            if cost is None:
+                print("[graphify extract] subscription backend: no API-dollar estimate; usage is broker-reported")
+            elif merged["input_tokens"] or merged["output_tokens"]:
                 print(
                     f"[graphify extract] tokens: "
                     f"{merged['input_tokens']:,} in / "
@@ -5972,6 +6115,7 @@ def dispatch_command(cmd: str) -> None:
                     dedup=not no_dedup,
                     dedup_llm_backend=dedup_backend,
                     root=target,
+                    previous_data=_sanitized_baseline,
                 )
                 _shrink = _handle_unverified_semantic_shrink(
                     G.graph.get("_unverified_semantic_shrink") if hasattr(G, "graph") else None,
@@ -5993,7 +6137,7 @@ def dispatch_command(cmd: str) -> None:
                     _stamped_semantic = {
                         f for _flist in _manifest_files.values() for f in _flist
                     }
-                    _cleared_semantic = _shrink[2]
+                    _cleared_semantic = _shrink[2] | _baseline_partial
             except ValueError as exc:
                 # --no-dedup arms build_merge's #479 shrink guard, which refuses
                 # to drop nodes belonging to files this run neither re-extracted
@@ -6059,6 +6203,13 @@ def dispatch_command(cmd: str) -> None:
         from graphify.build import take_shrink_accounting as _take_shrink_accounting
         _dedup_collapsed, _pruned_nodes = _take_shrink_accounting(G)
         _force_write = cli_allow_partial or not _extraction_incomplete
+        if not _force_write and _rejected_baseline_nodes:
+            from graphify.export import existing_graph_node_count as _existing_graph_node_count
+            _existing_n = _existing_graph_node_count(graph_json_path)
+            if isinstance(_existing_n, int) and G.number_of_nodes() >= _existing_n - _rejected_baseline_nodes:
+                # Invalid discarded rows are not valid knowledge lost to a
+                # partial extraction. All other shrink protection still applies.
+                _force_write = True
         _dedup_shrink_counts: tuple[int, int] | None = None
         if (
             not _extraction_incomplete
@@ -6172,7 +6323,9 @@ def dispatch_command(cmd: str) -> None:
             )
         elif sem_cache_hits:
             print(f"[graphify extract] semantic cache: {sem_cache_hits} cached, {sem_cache_misses} re-extracted")
-        if merged["input_tokens"] or merged["output_tokens"]:
+        if cost is None:
+            print("[graphify extract] subscription backend: no API-dollar estimate; usage is broker-reported")
+        elif merged["input_tokens"] or merged["output_tokens"]:
             print(
                 f"[graphify extract] tokens: "
                 f"{merged['input_tokens']:,} in / "

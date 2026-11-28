@@ -9,9 +9,13 @@ graphs built before this module existed work unchanged.
 Heading detection reuses the Markdown extractor's own rules (ATX headings,
 CommonMark fences, leading frontmatter), so what counts as a heading here is
 exactly what the extractor turned into a node.
+
+Examples use their recorded whole-fence range and redacted span hash. A stale
+or inaccessible example returns its indexed preview, never a guessed new span.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +48,7 @@ class Section:
     text: str
     truncated: bool
     moved: bool
+    note: str = ""
 
 
 def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
@@ -106,35 +111,89 @@ def section_root(gp: Path) -> Path:
 def is_section_node(node: dict) -> bool:
     kind = node.get("node_kind")
     suffix = Path(str(node.get("source_file") or "")).suffix.lower()
-    return kind in ("heading", "page") and suffix in _MARKDOWN_SUFFIXES
+    return kind in ("heading", "page", "code_example") and suffix in _MARKDOWN_SUFFIXES
 
 
 def read_section(node: dict, root: Path,
                  max_chars: int = DEFAULT_MAX_CHARS) -> "tuple[Section | None, str]":
-    """Read the section a heading (or page) node opens. ``(section, "")`` or ``(None, reason)``."""
+    """Read a heading/page or indexed example. ``(section, "")`` or ``(None, reason)``."""
     label = str(node.get("label") or "")
     source_file = str(node.get("source_file") or "")
+    max_chars = max(1, max_chars)
     if not is_section_node(node):
-        return None, (f"'{label}' is not a Markdown heading or page. "
+        return None, (f"'{sanitize_label(redact_secrets(label))}' is not a Markdown heading, page or example. "
                       "get_section reads Markdown sections only.")
+
+    example = node.get("node_kind") == "code_example"
+    attrs = node.get("attributes")
+    attrs = attrs if isinstance(attrs, dict) else {}
+    m = _LINE_RE.match(str(node.get("source_location") or "").strip())
+    recorded = int(m.group(1)) if m else 0
+    start, end = attrs.get("start_line"), attrs.get("end_line")
+    valid_span = (type(start) is int and type(end) is int
+                  and 0 < start <= end and recorded == start)
+
+    def unavailable(reason: str) -> "tuple[Section | None, str]":
+        if not example:
+            return None, reason
+        preview = attrs.get("preview")
+        note = "Indexed preview; source stale/unavailable."
+        if not isinstance(preview, str):
+            preview = ""
+            note += " No stored preview is available."
+        note += f" {reason}"
+        preview = redact_secrets(_BODY_CONTROL_RE.sub("", preview.replace("\r\n", "\n").replace("\r", "\n")))
+        return Section(
+            sanitize_label(redact_secrets(source_file)), recorded,
+            end if valid_span else recorded, preview[:max_chars],
+            len(preview) > max_chars, False, note,
+        ), ""
+
     if node.get("repo"):
-        return None, (f"'{label}' comes from a merged multi-repo graph. "
-                      "Read it from that repo's own graph.")
+        if example:
+            return unavailable("Source belongs to a merged multi-repo graph; read it from that repo's own graph.")
+        return unavailable(f"'{sanitize_label(redact_secrets(label))}' comes from a merged multi-repo graph. "
+                           "Read it from that repo's own graph.")
     path = _resolve_inside(source_file, root)
     if path is None:
-        return None, f"Refusing to read '{source_file}': it is outside the project."
+        if example:
+            return unavailable("Source is outside the project; no source file was read.")
+        return unavailable(f"Refusing to read '{sanitize_label(redact_secrets(source_file))}': it is outside the project.")
     try:
         lines = _read_source_text(path, warn=False).splitlines()
     except (OSError, UnicodeError) as exc:
-        return None, f"Could not read {source_file}: {exc}"
+        if example:
+            return unavailable(f"Could not read current source ({type(exc).__name__}); run `graphify update .`.")
+        return unavailable(f"Could not read {sanitize_label(redact_secrets(source_file))}: "
+                           f"{sanitize_label(redact_secrets(str(exc)))}")
+
+    if example:
+        if not valid_span or end > len(lines):
+            return unavailable("The indexed fence range is no longer available; run `graphify update .`.")
+        enclosing = None
+        for line in lines[:start - 1]:
+            if enclosing is None:
+                enclosing = _fence_open(line)
+            elif _fence_closes(line, enclosing):
+                enclosing = None
+        fence = _fence_open(lines[start - 1])
+        closing = next((i + 1 for i in range(start, len(lines))
+                        if fence is not None and _fence_closes(lines[i], fence)), len(lines))
+        body = redact_secrets("\n".join(lines[start - 1:end]))
+        if (enclosing is not None or fence is None or closing != end
+                or hashlib.sha256(body.encode("utf-8")).hexdigest() != attrs.get("span_hash")):
+            return unavailable("The indexed fence changed or cannot be verified; run `graphify update .`.")
+        # Markdown is not masked by _read_source_text (only TS/TSX is). Redact
+        # the whole fence before hashing or truncating its displayed text.
+        body = redact_secrets(_BODY_CONTROL_RE.sub("", body))
+        return Section(sanitize_label(redact_secrets(source_file)), start, end,
+                       body[:max_chars], len(body) > max_chars, False), ""
 
     moved = False
     if node.get("node_kind") == "page":
         _, body_start = _split_frontmatter(lines)
         start, end = body_start + 1, len(lines)
     else:
-        m = _LINE_RE.match(str(node.get("source_location") or "").strip())
-        recorded = int(m.group(1)) if m else 0
         heads = _headings(lines)
         same = [h for h in heads
                 if h[2] == label or sanitize_label(h[2]) == sanitize_label(label)]
@@ -158,23 +217,28 @@ def read_section(node: dict, root: Path,
     truncated = len(body) > max_chars
     if truncated:
         body = body[:max_chars]
-    return Section(sanitize_label(source_file), start, end, body, truncated, moved), ""
+    return Section(sanitize_label(redact_secrets(source_file)), start, end, body, truncated, moved), ""
 
 
 def format_section(section: Section, label: str) -> str:
-    header = f"Section: {label}  [{section.source_file}:L{section.start}-L{section.end}]"
+    label = sanitize_label(redact_secrets(label))
+    source_file = sanitize_label(redact_secrets(section.source_file))
+    span = f"L{section.start}-L{section.end}" if section.start > 0 else "unknown span"
+    header = f"Section: {label}  [{source_file}:{span}]"
     notes = []
+    if section.note:
+        notes.append(sanitize_label(redact_secrets(section.note)))
     if section.moved:
         notes.append("The heading moved since indexing; run `graphify update .` "
                      "to refresh the graph.")
     if section.truncated:
-        notes.append(f"Truncated; read {section.source_file} lines "
-                     f"{section.start}-{section.end} for the rest.")
+        notes.append("Truncated indexed preview; more stored text was omitted." if section.note else
+                     f"Truncated; read {source_file} lines {section.start}-{section.end} for the rest.")
     return "\n".join([header, *(f"Note: {n}" for n in notes), "", section.text])
 
 
 def resolve_section_query(G, query: str) -> "tuple[str | None, str]":
-    """Resolve a heading label, node id or ``path::Heading`` to one section node.
+    """Resolve a heading/example label, node id or ``path::Heading`` to one section node.
 
     A code symbol that shares a heading's name must not shadow it, so a query
     that is ambiguous or lands on a non-section node is retried against the

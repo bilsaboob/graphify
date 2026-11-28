@@ -410,7 +410,50 @@ def mint_external_stubs_in_data(data: dict) -> None:
             minted.add(tgt)
 
 
-def finalize_raw_graph_endpoints(data: dict) -> None:
+def _remember_document_references(nodes: list[dict], missing_rows: list[tuple[dict, list[str]]], *, root=None) -> None:
+    """Keep omitted endpoints as documentary clues rather than phantom code."""
+    from graphify.security import redact_secrets
+
+    docs = {n.get("id"): n for n in nodes if isinstance(n, dict)
+            and Path(str(n.get("source_file") or "")).suffix.lower() == ".md"}
+    by_source = {}
+    for node in docs.values():
+        sf = _norm_source_file(node.get("source_file"), str(root) if root else None)
+        if sf not in by_source or node.get("node_kind") == "page":
+            by_source[sf] = node
+    for row, missing in missing_rows:
+        sf = row.get("source_file")
+        if sf and Path(str(sf)).suffix.lower() != ".md":
+            continue
+        owner = next((docs[nid] for nid in (row.get("source"), row.get("target"))
+                      if isinstance(nid, str) and nid in docs), None)
+        if owner is None:
+            owner = by_source.get(_norm_source_file(sf, str(root) if root else None))
+        if owner is None or not missing:
+            continue
+        if isinstance(row.get("nodes"), list):
+            unresolved = row.setdefault("unresolved_members", [])
+            if isinstance(unresolved, list):
+                unresolved.extend(m for m in missing if m not in unresolved)
+        attrs = owner.get("attributes")
+        if not isinstance(attrs, dict):
+            attrs = {} if attrs is None else {"original_attributes": attrs}
+            owner["attributes"] = attrs
+        # Literal Markdown links have their own parser-provided document_links.
+        # A stale AST endpoint ID is not evidence of a code symbol mention.
+        field = "code_hints" if row.get("_origin") == "semantic" or "nodes" in row else "unresolved_references"
+        hints = attrs.setdefault(field, [])
+        if not isinstance(hints, list):
+            continue
+        for name in missing:
+            hint = {"text": redact_secrets(name),
+                    "source_location": row.get("source_location") or owner.get("source_location"),
+                    "relationship": redact_secrets(str(row.get("documented_relation") or row.get("relation") or row.get("label") or "reference"))}
+            if hint not in hints:
+                hints.append(hint)
+
+
+def finalize_raw_graph_endpoints(data: dict, *, root=None) -> None:
     """Apply build_from_json's endpoint rules to a raw (``--no-cluster``) graph.
 
     The clustered path builds the graph with :func:`build_from_json`, which mints
@@ -441,6 +484,9 @@ def finalize_raw_graph_endpoints(data: dict) -> None:
     links = data.get(key)
     if not isinstance(nodes, list) or not isinstance(links, list):
         return
+    from graphify.markdown_resolution import DOCUMENTATION_EDGE_PRODUCER, enrich_documentation
+    links[:] = [e for e in links if not isinstance(e, dict)
+                or e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
     # Match build_from_json's pre-validation alias folding before applying the
     # raw-path persistence rules. An edge that still has no relation afterwards
     # has no trustworthy semantic default and must not reach graph.json (#4809).
@@ -509,6 +555,7 @@ def finalize_raw_graph_endpoints(data: dict) -> None:
     kept: list = []
     referenced: set = set()
     dropped_schema_edges = 0
+    missing_document_refs = []
     for e in links:
         if not isinstance(e, dict):
             kept.append(e)
@@ -531,6 +578,9 @@ def finalize_raw_graph_endpoints(data: dict) -> None:
             kept.append(e)
             referenced.add(e.get("source", e.get("from")))
             referenced.add(e.get("target", e.get("to")))
+        else:
+            missing_document_refs.append((e, [str(e[field]) for field in ("source", "target")
+                                              if isinstance(e.get(field), str) and e[field] not in declared]))
     links[:] = kept
     if dropped_schema_edges:
         print(
@@ -542,7 +592,13 @@ def finalize_raw_graph_endpoints(data: dict) -> None:
         if isinstance(hyperedge, dict):
             members = hyperedge.get("nodes", hyperedge.get("members", hyperedge.get("node_ids", [])))
             if isinstance(members, list):
+                if Path(str(hyperedge.get("source_file") or "")).suffix.lower() == ".md":
+                    missing = [m for m in members if isinstance(m, str) and m not in declared]
+                    missing_document_refs.append((hyperedge, missing))
+                    hyperedge["nodes"] = [m for m in members if isinstance(m, str) and m in declared]
+                    members = hyperedge["nodes"]
                 referenced.update(m for m in members if isinstance(m, str))
+    _remember_document_references(nodes, missing_document_refs, root=root)
     nodes[:] = [
         n for n in nodes
         if not (
@@ -553,6 +609,7 @@ def finalize_raw_graph_endpoints(data: dict) -> None:
             and n.get("id") not in referenced
         )
     ]
+    enrich_documentation(nodes, links, root=root)
 
 # Language interop families, keyed by extension, for the cross-language phantom-edge
 # guard in the edge loop below. Families group by REAL interop (JS/TS share a module
@@ -980,7 +1037,9 @@ def _has_independent_semantic_evidence(node: dict) -> bool:
     evidence would stop those ghosts folding and let duplicates proliferate
     on real graphs (#4896).
     """
-    return any(
+    from graphify.dedup import _is_enriched_document
+
+    return _is_enriched_document(node) or any(
         node.get(field) not in (None, "", [], {})
         for field in ("rationale", "source_url", "author", "contributor")
     )
@@ -1632,6 +1691,8 @@ def _doc_twin_remap(nodes: list) -> dict[str, str]:
     record must be a page/file node; an AST record or a heading at the `_doc`
     ID is never a semantic twin. Legacy unmarked file twins remain supported.
     """
+    from graphify.dedup import _is_enriched_document
+
     by_id: dict[str, dict] = {}
     for n in nodes:
         if isinstance(n, dict) and n.get("id"):
@@ -1648,6 +1709,8 @@ def _doc_twin_remap(nodes: list) -> dict[str, str]:
             continue
         if node.get("file_type") != "document" or bare.get("file_type") != "document":
             continue
+        if _is_enriched_document(node):
+            continue
         if node.get("node_kind") == "heading" or node.get("_origin") == "ast":
             continue
         if bare.get("node_kind") == "heading":
@@ -1658,6 +1721,131 @@ def _doc_twin_remap(nodes: list) -> dict[str, str]:
             continue
         remap[nid[:-4]] = nid
     return remap
+
+
+def preserve_semantic_identities(
+    structural: dict, semantic: dict, *, retained: dict | None = None,
+    root: str | Path | None = None,
+) -> None:
+    """Separate document occurrences without changing actual code identities.
+
+    Keep fragments separate so a document alias cannot retarget another
+    fragment's code references. Mixed raw fragments are supported at merge
+    boundaries: source ownership and tier select the documentary endpoints.
+    """
+    from hashlib import sha256
+    from graphify.markdown_resolution import _is_advisory_document
+
+    fragments = [structural, semantic] + ([retained] if retained is not None else [])
+    nodes = [n for fragment in fragments for n in fragment.get("nodes", [])
+             if isinstance(n, dict) and isinstance(n.get("id"), str)]
+
+    def source(row):
+        return _norm_source_file(row.get("source_file"), str(root) if root is not None else None) or ""
+
+    doc_sources = {source(n) for n in nodes if _is_advisory_document(n)}
+
+    def document(row):
+        return _is_advisory_document(row) or ("file_type" not in row and source(row) in doc_sources)
+
+    def occurrence(row):
+        return source(row), _is_ast_tier(row), row.get("node_kind")
+
+    code_ids = {n["id"] for n in nodes if n.get("file_type") == "code" and not document(n)}
+    meanings = {n["id"] for n in nodes if document(n) and not _is_ast_tier(n)
+                and _has_independent_semantic_evidence(n)}
+    occupied: dict[str, list[dict]] = {}
+    for node in nodes:
+        occupied.setdefault(node["id"], []).append(node)
+
+    for fragment in fragments:
+        remap: dict[tuple[str, str, bool], str] = {}
+        by_tier: dict[tuple[str, bool], set[str]] = {}
+        for node in fragment.get("nodes", []):
+            if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not document(node):
+                continue
+            nid, ast = node["id"], _is_ast_tier(node)
+            if nid not in code_ids and not (ast and nid in meanings):
+                continue
+            # The AST spelling matches watch's existing heading alias. Semantic
+            # aliases include document ownership, not labels or changing lines.
+            salt = nid if ast else source(node) + "\0" + nid
+            alias = nid + ("__ast_" if ast else "__doc_") + sha256(salt.encode("utf-8")).hexdigest()[:16]
+            if any(not document(other) or occurrence(other) != occurrence(node)
+                   for other in occupied.get(alias, [])):
+                raise ValueError(f"Document ID collision cannot be safely rekeyed: {nid}")
+            occupied.setdefault(alias, []).append(node)
+            remap[nid, source(node), ast] = alias
+            by_tier.setdefault((nid, ast), set()).add(alias)
+            if nid in code_ids:
+                attributes = dict(node["attributes"]) if isinstance(node.get("attributes"), dict) else {}
+                hints = list(attributes["code_hints"]) if isinstance(attributes.get("code_hints"), list) else []
+                hint = {"text": nid, "source_location": node.get("source_location"), "kind": "id_collision"}
+                if hint not in hints:
+                    hints.append(hint)
+                attributes["code_hints"] = hints
+                node["attributes"] = attributes
+            node["id"] = alias
+
+        def endpoint(nid, row):
+            if not _hashable(nid):
+                return nid
+            ast = _is_ast_tier(row)
+            exact = remap.get((nid, source(row), ast))
+            if exact is not None:
+                return exact
+            candidates = by_tier.get((nid, ast), set())
+            return next(iter(candidates)) if len(candidates) == 1 else nid
+
+        for bucket in ("edges", "links"):
+            for edge in fragment.get(bucket, []):
+                if not isinstance(edge, dict) or not document(edge):
+                    continue
+                for field in ("source", "target", "_src", "_tgt"):
+                    if field in edge:
+                        edge[field] = endpoint(edge[field], edge)
+        for group in fragment.get("hyperedges", []):
+            if isinstance(group, dict) and document(group) and isinstance(group.get("nodes"), list):
+                group["nodes"] = [endpoint(nid, group) for nid in group["nodes"]]
+
+
+def _enrich_document_graph(G: nx.Graph, *, root=None, original_edges=None) -> None:
+    """Adapt the shared advisory pass at existing NetworkX publication boundaries."""
+    from graphify.markdown_resolution import DOCUMENTATION_EDGE_PRODUCER, enrich_documentation
+
+    nodes = [{**attrs, "id": nid} for nid, attrs in G.nodes(data=True)]
+    edges = [
+        {**attrs, "source": attrs.get("_src", src), "target": attrs.get("_tgt", tgt)}
+        for src, tgt, attrs in G.edges(data=True)
+    ]
+    if isinstance(original_edges, list):
+        originals = [e for e in original_edges if isinstance(e, dict)
+                     and e.get("source") in G and e.get("target") in G
+                     and e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
+        # Originals retain distinct claim locations/roles lost by a simple
+        # graph. Do not also feed their coalesced G representation to the pass.
+        represented = {(e.get("source"), e.get("target"), e.get("relation")) for e in originals}
+        edges = originals + [e for e in edges
+                             if (e.get("source"), e.get("target"), e.get("relation")) not in represented]
+    enrich_documentation(nodes, edges, root=root)
+    for node in nodes:
+        if "attributes" in node:
+            G.nodes[node["id"]]["attributes"] = node["attributes"]
+    if G.is_multigraph():
+        G.remove_edges_from([(u, v, key) for u, v, key, attrs in G.edges(keys=True, data=True)
+                             if attrs.get("_generated_by") == DOCUMENTATION_EDGE_PRODUCER])
+    else:
+        G.remove_edges_from([(u, v) for u, v, attrs in G.edges(data=True)
+                             if attrs.get("_generated_by") == DOCUMENTATION_EDGE_PRODUCER])
+    generated = [e for e in edges if e.get("_generated_by") == DOCUMENTATION_EDGE_PRODUCER]
+    for edge in generated:
+        src, tgt = edge["source"], edge["target"]
+        attrs = {key: value for key, value in edge.items() if key not in {"source", "target"}}
+        G.add_edge(src, tgt, **{**attrs, "_src": src, "_tgt": tgt})
+    if isinstance(original_edges, list):
+        original_edges[:] = [e for e in original_edges if not isinstance(e, dict)
+                             or e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
+        original_edges.extend(generated)
 
 
 def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None,
@@ -1678,6 +1866,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # NetworkX <= 3.1 serialised edges as "links"; remap to "edges" for compatibility.
     if "edges" not in extraction and "links" in extraction:
         extraction = dict(extraction, edges=extraction["links"])
+    from graphify.markdown_resolution import DOCUMENTATION_EDGE_PRODUCER
+    if isinstance(extraction.get("edges"), list):
+        # Do not let coalescing mix a generated marker into an authored edge.
+        extraction["edges"][:] = [e for e in extraction["edges"] if not isinstance(e, dict)
+                                  or e.get("_generated_by") != DOCUMENTATION_EDGE_PRODUCER]
 
     # Hyperedge persistence is dual-slot (#2485): to_json writes BOTH a
     # top-level `hyperedges` key AND the nested `graph.hyperedges` (node_link
@@ -1750,6 +1943,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         if isinstance(edge, dict):
             _fold_edge_aliases(edge)
 
+    preserve_semantic_identities(extraction, {}, root=_root)
     errors = validate_extraction(extraction)
     # Dangling edges (stdlib/external imports) are expected - only warn about real schema errors.
     real_errors = [e for e in errors if "does not match any node id" not in e]
@@ -1831,7 +2025,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                 if edge.get("source") == edge.get("target") and (s0 in _doc_remap or t0 in _doc_remap):
                     continue
             _new_edges.append(edge)
-        extraction["edges"] = _new_edges
+        extraction["edges"][:] = _new_edges
         for he in extraction.get("hyperedges", []) or []:
             if isinstance(he, dict) and isinstance(he.get("nodes"), list):
                 # Same hashability guard as the _rekey pass above (#2486).
@@ -2110,6 +2304,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # last write wins, so an unstable iteration order flips _src/_tgt run-to-run
     # and makes the serialized graph churn. Sorting fixes the last-write outcome.
     dropped_schema_edges = 0
+    missing_document_refs = []
     for edge in sorted(
         extraction.get("edges", []),
         key=lambda e: (
@@ -2164,6 +2359,8 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             ):
                 _mint_external_stub(G, node_set, tgt)
             else:
+                missing_document_refs.append(({**edge, "source": src, "target": tgt},
+                                              [str(n) for n in (src, tgt) if n not in node_set]))
                 continue  # external/stdlib target on a non-import relation - expected
         # `target_file` is a transient import-disambiguation salt hint (#1814)
         # with no downstream reader; it holds an absolute path, so it must never
@@ -2397,6 +2594,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             # rather than require two survivors).
             if isinstance(he, dict) and isinstance(he.get("nodes"), list):
                 valid_members = []
+                missing_members = []
                 for m in he["nodes"]:
                     try:
                         hash(m)
@@ -2406,7 +2604,12 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                         m = norm_to_id.get(_normalize_id(m), m)
                     if m in node_set:
                         valid_members.append(m)
-                if not valid_members:
+                    elif isinstance(m, str):
+                        missing_members.append(m)
+                doc_group = Path(str(he.get("source_file") or "")).suffix.lower() == ".md"
+                if doc_group and missing_members:
+                    missing_document_refs.append((he, missing_members))
+                if not valid_members and not doc_group:
                     print(
                         f"[graphify] WARNING: dropping hyperedge "
                         f"{he.get('id', '?')!r} — none of its members "
@@ -2442,6 +2645,13 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     _qualify_csharp_method_labels(G)
     if framework_evidence is not None:
         G.graph["semantic_evidence"] = framework_evidence
+    if missing_document_refs:
+        document_nodes = [{**attrs, "id": nid} for nid, attrs in G.nodes(data=True)]
+        _remember_document_references(document_nodes, missing_document_refs, root=_root)
+        for node in document_nodes:
+            if "attributes" in node:
+                G.nodes[node["id"]]["attributes"] = node["attributes"]
+    _enrich_document_graph(G, root=_root, original_edges=extraction.get("edges"))
     return G
 
 
@@ -2481,6 +2691,7 @@ def build(
         combined["hyperedges"].extend(ext.get("hyperedges", []))
         combined["input_tokens"] += ext.get("input_tokens", 0)
         combined["output_tokens"] += ext.get("output_tokens", 0)
+    preserve_semantic_identities(combined, {}, root=root)
     evidence = combine_evidence(extractions, root=root)
     if evidence is not None:
         combined["semantic_evidence"] = evidence
@@ -2622,7 +2833,7 @@ def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dic
     return deduped_nodes, deduped_edges
 
 
-def _load_existing_graph(graph_path: Path, *, metadata_out: dict | None = None) -> "tuple[list, list, list, bool] | None":
+def _load_existing_graph(graph_path: Path, *, metadata_out: dict | None = None, data: dict | None = None) -> "tuple[list, list, list, bool] | None":
     """Load (nodes, edges, hyperedges, directed) from an existing graph.json for
     an incremental merge, accepting both the ``links`` and ``edges`` spellings
     and either hyperedge persistence slot (top-level or ``graph.hyperedges``).
@@ -2641,17 +2852,18 @@ def _load_existing_graph(graph_path: Path, *, metadata_out: dict | None = None) 
     """
     if metadata_out is not None:
         metadata_out.pop("data", None)
-    if not graph_path.exists():
-        return None
-    from graphify.security import check_graph_file_size_cap
-    check_graph_file_size_cap(graph_path)
-    try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(
-            f"Cannot read {graph_path} for incremental merge: {exc}. "
-            "Delete the file and run a full rebuild."
-        ) from exc
+    if data is None:
+        if not graph_path.exists():
+            return None
+        from graphify.security import check_graph_file_size_cap
+        check_graph_file_size_cap(graph_path)
+        try:
+            data = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(
+                f"Cannot read {graph_path} for incremental merge: {exc}. "
+                "Delete the file and run a full rebuild."
+            ) from exc
     if not isinstance(data, dict):
         raise RuntimeError(f"Cannot read {graph_path}: graph must be a JSON object")
     from graphify.framework_pipeline import evidence_from_data
@@ -2702,6 +2914,65 @@ def _load_existing_graph(graph_path: Path, *, metadata_out: dict | None = None) 
         hyperedges,
         bool(data.get("directed", False)),
     )
+
+
+def _partial_semantic_sources(chunks: "Iterable[dict]", root=None) -> set[str]:
+    """Partial document contributions add information without replacing prior meaning."""
+    sources = set()
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        sources.update(str(sf) for sf in chunk.get("_partial_files", []) if sf)
+        sources.update(str(sf) for sf in chunk.get("uncovered_files", []) if sf)
+        for bucket in ("nodes", "edges", "hyperedges"):
+            for row in chunk.get(bucket, []):
+                if isinstance(row, dict) and row.get("_partial") and row.get("source_file"):
+                    sources.add(str(row["source_file"]))
+    return sources | {_norm_source_file(sf, str(root) if root else None) or sf for sf in sources}
+
+
+def _retain_partial_details(chunks: list[dict], old_nodes: list, old_hyperedges: list, root=None) -> set[tuple]:
+    """Keep earlier details when a partial response repeats an entity/group."""
+    partial = _partial_semantic_sources(chunks, root)
+    if not partial:
+        return set()
+
+    from graphify.markdown_resolution import _is_advisory_document
+    prior_code = {"nodes": [n for n in old_nodes if isinstance(n, dict) and n.get("file_type") == "code"
+                            and not _is_advisory_document(n)]}
+    for chunk in chunks:
+        # Match a replayed document occurrence to its persisted alias before
+        # joining partial details or unioning hyperedge members. Old meanings
+        # are not passed here: tier replacement has not selected survivors yet.
+        preserve_semantic_identities(chunk, {}, retained=prior_code, root=root)
+
+    def key(row):
+        return row.get("id"), _norm_source_file(row.get("source_file"), str(root) if root else None)
+
+    prior_nodes = {key(n): n for n in old_nodes if isinstance(n, dict) and key(n)[1] in partial}
+    prior_groups = {key(h): h for h in old_hyperedges if isinstance(h, dict) and key(h)[1] in partial}
+    replaced_groups = set()
+    for chunk in chunks:
+        for node in chunk.get("nodes", []):
+            prior = prior_nodes.get(key(node)) if isinstance(node, dict) and not _is_ast_tier(node) else None
+            if prior:
+                merged = {**prior, **node}
+                old_attrs, new_attrs = prior.get("attributes"), node.get("attributes")
+                if isinstance(old_attrs, dict) and isinstance(new_attrs, dict):
+                    attrs = {**old_attrs, **new_attrs}
+                    for field in ("aliases", "code_hints"):
+                        if isinstance(old_attrs.get(field), list) and isinstance(new_attrs.get(field), list):
+                            attrs[field] = old_attrs[field] + [v for v in new_attrs[field] if v not in old_attrs[field]]
+                    merged["attributes"] = attrs
+                node.update(merged)
+        for group in chunk.get("hyperedges", []):
+            prior = prior_groups.get(key(group)) if isinstance(group, dict) else None
+            if prior:
+                members = list(prior.get("nodes", []))
+                members.extend(n for n in group.get("nodes", []) if n not in members)
+                group.update({**prior, **group, "nodes": members})
+                replaced_groups.add(key(group))
+    return replaced_groups
 
 
 def _tier_replacement_sources(
@@ -2780,6 +3051,10 @@ def _tier_replacement_sources(
     new_ast_sources = {
         sf for sf in new_ast_sources if _abs_identity(sf, failure_root) not in failed_ast
     }
+    partial = {_abs_identity(sf, failure_root) for sf in _partial_semantic_sources(chunks, root)}
+    new_sem_sources = {
+        sf for sf in new_sem_sources if _abs_identity(sf, failure_root) not in partial
+    }
     return new_ast_sources, new_sem_sources
 
 
@@ -2790,6 +3065,7 @@ def merge_raw_extraction(
     root: "str | Path | None" = None,
     *,
     ast_sources: "Iterable[str | Path] | None" = None,
+    previous_data: dict | None = None,
 ) -> dict:
     """Merge the existing raw graph.json forward into a fresh raw extraction
     (the ``extract --no-cluster`` incremental path, #2169).
@@ -2824,8 +3100,11 @@ def merge_raw_extraction(
     incoming_evidence = evidence_from_data(new)
     graph_path = Path(graph_path)
     metadata: dict = {}
-    loaded = _load_existing_graph(graph_path, metadata_out=metadata)
+    loaded = _load_existing_graph(graph_path, metadata_out=metadata, **(
+        {"data": previous_data} if previous_data is not None else {}
+    ))
     if loaded is None:
+        preserve_semantic_identities(new, {}, root=root)
         if incoming_evidence is not None:
             new["semantic_evidence"] = combine_evidence(
                 [new], root=root,
@@ -2840,6 +3119,7 @@ def merge_raw_extraction(
         str(Path(root).resolve()) if root is not None
         else _infer_merge_root(graph_path)
     )
+    partial_groups = _retain_partial_details([new], existing_nodes, existing_hyperedges, _eff_root)
 
     # Tier-scoped replace, mirroring build_merge (#2333/#2336, COEXIST, #3411): a
     # source re-extracted this run replaces only the tier(s) actually present
@@ -2850,7 +3130,7 @@ def merge_raw_extraction(
     new_ast_sources, new_sem_sources = _tier_replacement_sources(
         [new], root=_eff_root, ast_sources=ast_sources
     )
-    new_sources: set[str] = new_ast_sources | new_sem_sources
+    new_sources: set[str] = new_ast_sources | new_sem_sources | _partial_semantic_sources([new], _eff_root)
 
     # "Replace" wins over a contradictory "delete" of the same source (#1796),
     # in both string and absolute-identity space (#2012) — as in build_merge.
@@ -2907,7 +3187,8 @@ def merge_raw_extraction(
     if new_sem_sources:
         prior_sem_counts: dict[str, int] = {}
         for n in existing_nodes:
-            if isinstance(n, dict) and not _is_ast_tier(n):
+            if (isinstance(n, dict) and not _is_ast_tier(n)
+                    and n.get("_generated_by") != "markdown-reference-anchor-v1"):
                 sf = n.get("source_file")
                 if sf:
                     canon = _norm_source_file(sf, _eff_root) or sf
@@ -2915,13 +3196,16 @@ def merge_raw_extraction(
 
         fresh_sem_counts: dict[str, int] = {}
         for n in new.get("nodes", []):
-            if isinstance(n, dict) and not _is_ast_tier(n):
+            if (isinstance(n, dict) and not _is_ast_tier(n)
+                    and n.get("_generated_by") != "markdown-reference-anchor-v1"):
                 sf = n.get("source_file")
                 if sf:
                     canon = _norm_source_file(sf, _eff_root) or sf
                     fresh_sem_counts[canon] = fresh_sem_counts.get(canon, 0) + 1
 
         for canon_sf, fresh_count in fresh_sem_counts.items():
+            if canon_sf not in new_sem_sources:
+                continue
             prior_count = prior_sem_counts.get(canon_sf, 0)
             if prior_count > 1 and fresh_count < prior_count:
                 unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
@@ -2933,9 +3217,15 @@ def merge_raw_extraction(
         replaced_sources=new_ast_sources if previous_evidence is not None else (),
         deleted_sources=prune_sources or (),
     )
-    new["nodes"] = [n for n in existing_nodes if not _dropped(n)] + list(new.get("nodes", []))
-    new["edges"] = [e for e in existing_edges if not _dropped(e)] + list(new.get("edges", []))
-    carried_hyper = [he for he in existing_hyperedges if not _dropped(he)]
+    carried_hyper = [
+        he for he in existing_hyperedges if not _dropped(he)
+        and (he.get("id"), _norm_source_file(he.get("source_file"), _eff_root)) not in partial_groups
+    ]
+    retained = {"nodes": [n for n in existing_nodes if not _dropped(n)],
+                "edges": [e for e in existing_edges if not _dropped(e)], "hyperedges": carried_hyper}
+    preserve_semantic_identities(new, {}, retained=retained, root=_eff_root)
+    new["nodes"] = retained["nodes"] + list(new.get("nodes", []))
+    new["edges"] = retained["edges"] + list(new.get("edges", []))
     if carried_hyper or new.get("hyperedges"):
         new["hyperedges"] = carried_hyper + list(new.get("hyperedges", []))
     if unverified_semantic_shrink:
@@ -2957,12 +3247,14 @@ def build_merge(
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
     ast_sources: "Iterable[str | Path] | None" = None,
+    previous_data: dict | None = None,
 ) -> nx.Graph:
     """Load existing graph.json and return it merged with ``new_chunks``.
 
     Does NOT write to disk — the caller persists the result, e.g. via
     ``export.to_json(G, communities, graph_path, force=True)`` after
-    clustering. ``graph_path`` is read-only here.
+    clustering. ``graph_path`` is read-only here. ``previous_data`` lets the
+    CLI reuse its validated, ownership-scoped baseline instead of rereading it.
 
     Re-extracted files REPLACE their prior contribution per tier (#2333/#2336, #3411):
     a source_file present in new_chunks has its existing nodes/edges dropped
@@ -2986,7 +3278,9 @@ def build_merge(
     new_chunks = list(new_chunks)
     graph_path = Path(graph_path if graph_path is not None else _default_graph_json())
     metadata: dict = {}
-    _loaded = _load_existing_graph(graph_path, metadata_out=metadata)
+    _loaded = _load_existing_graph(graph_path, metadata_out=metadata, **(
+        {"data": previous_data} if previous_data is not None else {}
+    ))
     if _loaded is not None:
         existing_nodes, existing_edges, existing_hyperedges, existing_directed = _loaded
         had_graph = True
@@ -3037,10 +3331,11 @@ def build_merge(
     # nodes/edges. Falls back to AST node source_file only when no provenance is
     # provided.
     _replace_root = _eff_root
+    _retain_partial_details(new_chunks, existing_nodes, existing_hyperedges, _replace_root)
     new_ast_sources, new_sem_sources = _tier_replacement_sources(
         new_chunks, root=_replace_root, ast_sources=ast_sources
     )
-    new_sources: set[str] = new_ast_sources | new_sem_sources
+    new_sources: set[str] = new_ast_sources | new_sem_sources | _partial_semantic_sources(new_chunks, _replace_root)
     # True on-disk baseline for the #479 shrink accounting at the end (#2497):
     # the rebind below removes the re-extracted sources' old nodes from
     # existing_nodes, so any later size comparison against the rebound list can
@@ -3072,7 +3367,8 @@ def build_merge(
     if had_graph and new_sem_sources:
         prior_sem_counts: dict[str, int] = {}
         for n in _disk_nodes:
-            if isinstance(n, dict) and not _is_ast_tier(n):
+            if (isinstance(n, dict) and not _is_ast_tier(n)
+                    and n.get("_generated_by") != "markdown-reference-anchor-v1"):
                 sf = n.get("source_file")
                 if sf:
                     canon = _norm_source_file(sf, _replace_root) or sf
@@ -3081,13 +3377,16 @@ def build_merge(
         fresh_sem_counts: dict[str, int] = {}
         for ch in new_chunks:
             for n in ch.get("nodes", []):
-                if isinstance(n, dict) and not _is_ast_tier(n):
+                if (isinstance(n, dict) and not _is_ast_tier(n)
+                        and n.get("_generated_by") != "markdown-reference-anchor-v1"):
                     sf = n.get("source_file")
                     if sf:
                         canon = _norm_source_file(sf, _replace_root) or sf
                         fresh_sem_counts[canon] = fresh_sem_counts.get(canon, 0) + 1
 
         for canon_sf, fresh_count in fresh_sem_counts.items():
+            if canon_sf not in new_sem_sources:
+                continue
             prior_count = prior_sem_counts.get(canon_sf, 0)
             if prior_count > 1 and fresh_count < prior_count:
                 unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
@@ -3508,6 +3807,7 @@ def build_merge(
     if _replaced_sources:
         G.graph["_replaced_sources"] = sorted(_replaced_sources)
 
+    _enrich_document_graph(G, root=_eff_root)
     return G
 
 

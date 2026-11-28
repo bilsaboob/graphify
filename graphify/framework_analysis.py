@@ -20,7 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from graphify.security import redact_secrets
+from graphify.security import redact_secrets, redact_source_credentials
 
 if TYPE_CHECKING:
     from graphify.framework_config import AnalysisOptions
@@ -154,7 +154,9 @@ def serialize_tree(source: str, language: str = "typescript") -> dict:
     return result
 
 
-def _source_identity(source: str, relative_path: str, language: str) -> bytes:
+def _source_identity(
+    source: str, relative_path: str, language: str, *, check_credentials: bool = True
+) -> bytes:
     if not isinstance(source, str) or not isinstance(relative_path, str):
         raise FrameworkAnalysisError("Source and relative path must be text")
     try:
@@ -170,27 +172,48 @@ def _source_identity(source: str, relative_path: str, language: str) -> bytes:
         or any(ord(char) < 32 or ord(char) == 127 for char in relative_path)
     ):
         raise FrameworkAnalysisError("Evidence requires a canonical project-relative source path")
+    if redact_secrets(relative_path) != relative_path:
+        raise FrameworkAnalysisError(f"Credential-shaped source path: {redact_secrets(relative_path)}")
     if not isinstance(language, str) or language not in {"typescript", "tsx"}:
         raise FrameworkAnalysisError("Framework analysis supports TypeScript and TSX only")
     if len(raw) > MAX_SOURCE_BYTES:
         raise FrameworkAnalysisError("Source exceeds the analysis byte limit")
-    if redact_secrets(source) != source:
+    redacted = redact_secrets(source) if check_credentials else source
+    if redacted != source:
+        first_difference = next(
+            (index for index, (original, safe) in enumerate(zip(source, redacted)) if original != safe),
+            min(len(source), len(redacted)),
+        )
+        line = source.count("\n", 0, first_difference) + 1
+        safe_path = redact_secrets(relative_path)
         raise FrameworkAnalysisError(
-            "Cannot retain exact semantic source: credential-shaped content; "
+            f"Cannot retain exact semantic source: credential-shaped content in {safe_path}:{line}; "
             "remove the inline credential or explicitly exclude the file"
         )
     return raw
 
 
 def make_document(source: str, relative_path: str, language: str = "typescript") -> dict:
+    # Only this preprocessing step may receive original credential-shaped text.
+    # The Node worker and persisted validators still reject unredacted input.
+    _source_identity(source, relative_path, language, check_credentials=False)
+    try:
+        source, redaction = redact_source_credentials(source, language)
+    except ValueError as exc:
+        raise FrameworkAnalysisError(
+            f"Cannot safely redact source {redact_secrets(relative_path)}: {exc}"
+        ) from exc
     raw = _source_identity(source, relative_path, language)
-    return {
+    document = {
         "source": source,
         "sourceHash": hashlib.sha256(raw).hexdigest(),
         "relativePath": relative_path,
         "language": language,
         "tree": serialize_tree(source, language),
     }
+    if redaction is not None:
+        document["redaction"] = redaction
+    return document
 
 
 def _node_environment() -> dict[str, str]:
@@ -229,6 +252,8 @@ def analysis_fingerprint(*, options: AnalysisOptions | dict | None = None) -> st
         (b"source-identity\0", Path(__file__).with_name("build.py")),
         (b"evidence-lifecycle\0", Path(__file__).with_name("framework_pipeline.py")),
         (b"refresh-policy\0", Path(__file__).with_name("watch.py")),
+        (b"source-redaction\0", Path(__file__).with_name("security.py")),
+        (b"source-reader\0", Path(__file__).parent / "extractors" / "base.py"),
     ):
         content = hashlib.sha256()
         with path.open("rb") as stream:
@@ -255,21 +280,119 @@ def options_for_root(root: Path) -> AnalysisOptions:
         raise FrameworkAnalysisError("Cannot read valid framework analysis configuration") from exc
 
 
+_JSON_STRING_CHUNK_CHARS = 4096
+# Each CST edge adds a children array, a field/node object, and a node object.
+_JSON_MAX_DEPTH = 3 * MAX_TREE_DEPTH + 8
+
+
 def _encode_json(value, maximum: int) -> bytes:
+    """Stream compact UTF-8 JSON without propagating tokens through ancestors."""
+    if type(maximum) is not int or maximum < 0:
+        raise FrameworkAnalysisError("Invalid framework analysis request byte limit")
     encoded = bytearray()
+    encode_string = json.encoder.encode_basestring
+    stack = []
+    active = set()
+
+    def write(block: bytes) -> None:
+        if len(block) > maximum - len(encoded):
+            raise OverflowError
+        encoded.extend(block)
+
+    def write_string(text: str) -> None:
+        size = str.__len__(text)
+        if size + 2 > maximum - len(encoded):
+            raise OverflowError
+        if size <= _JSON_STRING_CHUNK_CHARS:
+            write(encode_string(text).encode("utf-8"))
+            return
+        # Bound scratch space even when escaping or UTF-8 expands a huge string.
+        write(b'"')
+        for start in range(0, size, _JSON_STRING_CHUNK_CHARS):
+            chunk = str.__getitem__(text, slice(start, start + _JSON_STRING_CHUNK_CHARS))
+            write(encode_string(chunk)[1:-1].encode("utf-8"))
+        write(b'"')
+
+    def number(item) -> str:
+        if isinstance(item, int):
+            # Decimal output needs at least one byte per four bits.
+            if int.bit_length(item) > 4 * (maximum - len(encoded)):
+                raise OverflowError
+            return int.__repr__(item)
+        text = float.__repr__(item)
+        if text in {"nan", "inf", "-inf"}:
+            raise ValueError
+        return text
+
     try:
-        for chunk in json.JSONEncoder(
-            ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).iterencode(value):
-            block = chunk.encode("utf-8")
-            if len(encoded) + len(block) > maximum:
-                raise FrameworkAnalysisError("Framework analysis request exceeds its byte limit")
-            encoded.extend(block)
-    except (UnicodeError, ValueError, TypeError, RecursionError) as exc:
+        while True:
+            if isinstance(value, str):
+                write_string(value)
+            elif value is None:
+                write(b"null")
+            elif value is True:
+                write(b"true")
+            elif value is False:
+                write(b"false")
+            elif isinstance(value, (int, float)):
+                write(number(value).encode("ascii"))
+            elif isinstance(value, (dict, list, tuple)):
+                marker = id(value)
+                if marker in active:
+                    raise ValueError
+                if len(stack) >= _JSON_MAX_DEPTH:
+                    raise RecursionError
+                mapping = isinstance(value, dict)
+                write(b"{" if mapping else b"[")
+                iterator = iter(value.items()) if mapping else iter(value)
+                stack.append([iterator, marker, mapping, True])
+                active.add(marker)
+            else:
+                raise TypeError
+
+            while stack:
+                frame = stack[-1]
+                iterator, marker, mapping, first = frame
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    stack.pop()
+                    active.remove(marker)
+                    write(b"}" if mapping else b"]")
+                    continue
+                if first:
+                    frame[3] = False
+                else:
+                    write(b",")
+                if mapping:
+                    key, value = item
+                    if not isinstance(key, str):
+                        if key is None:
+                            key = "null"
+                        elif key is True:
+                            key = "true"
+                        elif key is False:
+                            key = "false"
+                        elif isinstance(key, (int, float)):
+                            key = number(key)
+                        else:
+                            raise TypeError
+                    write_string(key)
+                    write(b":")
+                else:
+                    value = item
+                break
+            else:
+                return bytes(encoded)
+    except OverflowError:
+        raise FrameworkAnalysisError("Framework analysis request exceeds its byte limit") from None
+    except RecursionError:
+        raise FrameworkAnalysisError("Framework analysis request exceeds its depth limit") from None
+    except Exception:
+        # Encoder and user-defined container errors must not echo source values.
         raise FrameworkAnalysisError(
             "Framework analysis request is not bounded valid JSON"
-        ) from exc
-    return bytes(encoded)
+        ) from None
 
 
 def _options(value) -> AnalysisOptions:
@@ -279,7 +402,8 @@ def _options(value) -> AnalysisOptions:
     if type(value) is not dict:
         raise FrameworkAnalysisError("Framework analysis options must be an object")
     try:
-        normalized = normalize_analysis_options(value, max_limits=ANNOTATION_LIMITS)
+        # The development Node oracle retains its original eight-plugin protocol.
+        normalized = normalize_analysis_options(value, max_limits={**ANNOTATION_LIMITS, "maxPlugins": 8})
     except (TypeError, ValueError) as exc:
         raise FrameworkAnalysisError("Invalid framework analysis options") from exc
     if normalized["limits"]["maxPlugins"] < len(PRODUCERS):
@@ -484,17 +608,21 @@ def _run_worker(request: dict, *, timeout: float = 120.0) -> dict:
 
 
 def _document_metrics(document: dict) -> tuple[int, int, int]:
-    if type(document) is not dict or set(document) != {
+    fields = {
         "source",
         "sourceHash",
         "relativePath",
         "language",
         "tree",
-    }:
+    }
+    if type(document) is not dict or not fields <= set(document) or set(document) - fields - {"redaction"}:
         raise FrameworkAnalysisError("Invalid framework source document")
     raw = _source_identity(document["source"], document["relativePath"], document["language"])
     if hashlib.sha256(raw).hexdigest() != document["sourceHash"]:
         raise FrameworkAnalysisError("Framework source hash does not match the exact snapshot")
+    if "redaction" in document:
+        from graphify.framework_evidence import validate_redaction
+        validate_redaction(document["source"], document["redaction"])
     pending, seen = [(document["tree"], 0)], set()
     fields = {
         "type",
@@ -528,6 +656,80 @@ def _document_metrics(document: dict) -> tuple[int, int, int]:
     return len(raw), len(seen), len(_encode_json(document, MAX_REQUEST_BYTES))
 
 
+def _validated_store_metrics(store: dict) -> tuple[int, int]:
+    """Measure an already validated fragment without re-walking prior batches.
+
+    The C encoder is safe here: the fragment has already passed the bounded
+    persisted-store validator. Account for canonical HTML/line escaping too.
+    """
+    encoded = json.dumps(store, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    size = len(encoded.encode("utf-8"))
+    size += 5 * sum(encoded.count(char) for char in ("<", ">", "&"))
+    size += 3 * sum(encoded.count(char) for char in ("\u2028", "\u2029"))
+    work = 0
+    pending = [store]
+    while pending:
+        item = pending.pop()
+        work += 1
+        if isinstance(item, dict):
+            work += len(item)  # Canonical JSON visits each key as well as its value.
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return size, work
+
+
+class _EvidenceAccumulator:
+    """Assemble disjoint, validated source batches with global budget checks."""
+
+    def __init__(self):
+        from graphify.framework_evidence import EvidenceLimits
+        self.limits = EvidenceLimits()
+        self.store = None
+        self.size = 0
+        self.work = 0
+        self.header_size = 0
+        self.header_work = 0
+
+    def append(self, fragment: dict) -> None:
+        size, work = _validated_store_metrics(fragment)
+        if self.store is None:
+            header = {**fragment, "documents": {}}
+            self.header_size, self.header_work = _validated_store_metrics(header)
+            candidate_size, candidate_work = size, work
+            candidate_count = len(fragment["documents"])
+        else:
+            if (
+                fragment["version"] != self.store["version"]
+                or fragment["manifests"] != self.store["manifests"]
+                or fragment["producers"] != self.store["producers"]
+            ):
+                raise FrameworkAnalysisError("Framework analyzer changed during the batch sequence")
+            if self.store["documents"].keys() & fragment["documents"].keys():
+                raise FrameworkAnalysisError("Duplicate source in framework evidence batches")
+            comma = int(bool(self.store["documents"]) and bool(fragment["documents"]))
+            candidate_size = self.size + size - self.header_size + comma
+            candidate_work = self.work + work - self.header_work
+            candidate_count = len(self.store["documents"]) + len(fragment["documents"])
+        if (
+            candidate_size > self.limits.max_store_bytes
+            or candidate_work > self.limits.max_work
+            or candidate_count > self.limits.max_documents
+        ):
+            raise FrameworkAnalysisError("Framework evidence corpus exceeds its aggregate limit")
+        self.size, self.work = candidate_size, candidate_work
+        if self.store is None:
+            self.store = {**fragment, "documents": dict(fragment["documents"])}
+        else:
+            self.store["documents"].update(fragment["documents"])
+
+    def finish(self):
+        from graphify.framework_evidence import validate_store
+        if self.store is None:
+            raise FrameworkAnalysisError("No framework evidence batch was produced")
+        return validate_store(self.store, limits=self.limits)
+
+
 def analyze_documents(
     documents: list[dict], *, options: AnalysisOptions | dict | None = None, timeout: float = 120.0
 ) -> EvidenceStore:
@@ -535,8 +737,8 @@ def analyze_documents(
     from graphify.framework_evidence import (
         EvidenceValidationError,
         canonical_json,
-        merge_evidence,
         validate_payload,
+        validate_store,
     )
 
     if type(documents) is not list:
@@ -566,15 +768,23 @@ def analyze_documents(
                 "One source document cannot fit the framework request limits"
             )
         metrics.append((size, nodes, wire))
-    store, analysis_id = None, None
+    accumulator, analysis_id = _EvidenceAccumulator(), None
 
     def dispatch(items: list[dict]) -> EvidenceStore:
         nonlocal analysis_id
-        payload = _run_worker({**base, "documents": items}, timeout=timeout)
+        # Original-file digests and transformation records stay with the trusted
+        # caller; the analyzer receives only sanitized text, syntax and hashes.
+        worker_items = [
+            {key: value for key, value in item.items() if key != "redaction"}
+            if "redaction" in item else item for item in items
+        ]
+        payload = _run_worker({**base, "documents": worker_items}, timeout=timeout)
         try:
             incoming = validate_payload(payload)
         except EvidenceValidationError as exc:
             raise FrameworkAnalysisError("Framework analyzer returned invalid evidence") from exc
+        if any("redaction" in entry for entry in incoming["documents"].values()):
+            raise FrameworkAnalysisError("Framework analyzer cannot author source redaction provenance")
         manifest = payload["manifest"]
         if (
             manifest["parserDigest"] != parser_digest
@@ -604,7 +814,9 @@ def analyze_documents(
                 raise FrameworkAnalysisError(
                     "Framework analyzer changed an admitted source snapshot"
                 )
-        return incoming
+            if "redaction" in item:
+                entry["redaction"] = item["redaction"]
+        return validate_store(incoming) if any("redaction" in item for item in items) else incoming
 
     batch: list[dict] = []
     source_bytes, tree_nodes, wire_bytes = 0, 0, overhead
@@ -616,20 +828,22 @@ def analyze_documents(
             or wire_bytes + 1 + wire > MAX_REQUEST_BYTES
         ):
             incoming = dispatch(batch)
-            store = merge_evidence(store, incoming)
+            accumulator.append(incoming)
             batch, source_bytes, tree_nodes, wire_bytes = [], 0, 0, overhead
         wire_bytes += wire + bool(batch)
         batch.append(document)
         source_bytes += size
         tree_nodes += nodes
-    if batch or store is None:
+    if batch or accumulator.store is None:
         incoming = dispatch(batch)
-        store = merge_evidence(store, incoming)
-    return store
+        accumulator.append(incoming)
+    return accumulator.finish()
 
 
 def analyze_paths(paths: list[Path], root: Path) -> EvidenceStore | None:
     """Analyze only supplied, already-admitted files; never expand the corpus."""
+    import sys
+    from time import monotonic
     from graphify.build import _prune_identity
     from graphify.rcfile import effective_suffix
 
@@ -643,9 +857,9 @@ def analyze_paths(paths: list[Path], root: Path) -> EvidenceStore | None:
         raise FrameworkAnalysisError("Cannot resolve framework source root") from exc
     configuration = options_for_root(base)
     implementation = analysis_fingerprint(options=configuration)
-    documents: list[dict] = []
     snapshots: list[tuple[Path, str]] = []
     seen: set[str] = set()
+    admitted: list[tuple[Path, str, str]] = []
     for path, suffix in selected:
         # Input paths keep normal cwd semantics. Resolve only the root alias,
         # never an in-corpus file alias, and do not guess alternate file paths.
@@ -661,6 +875,35 @@ def analyze_paths(paths: list[Path], root: Path) -> EvidenceStore | None:
         if identity_key in seen:
             continue
         seen.add(identity_key)
+        admitted.append((path, relative, suffix))
+    accumulator = _EvidenceAccumulator()
+    if len(admitted) > accumulator.limits.max_documents:
+        raise FrameworkAnalysisError("Framework source count exceeds its corpus limit")
+    total, completed = len(admitted), 0
+    started = monotonic()
+    print(f"[graphify frameworks] Starting source analysis for {total} files (no model calls).", file=sys.stderr, flush=True)
+    documents: list[dict] = []
+    source_bytes, tree_nodes = 0, 0
+
+    def flush_batch() -> None:
+        nonlocal documents, source_bytes, tree_nodes, completed
+        if not documents:
+            return
+        print(
+            f"[graphify frameworks] Analyzing {len(documents)} files; {completed}/{total} processed.",
+            file=sys.stderr, flush=True,
+        )
+        accumulator.append(analyze_documents(documents, options=configuration))
+        completed += len(documents)
+        documents, source_bytes, tree_nodes = [], 0, 0
+        print(
+            f"[graphify frameworks] {completed}/{total} processed ({monotonic() - started:.1f}s).",
+            file=sys.stderr, flush=True,
+        )
+
+    for index, (path, relative, suffix) in enumerate(admitted, 1):
+        if index == 1 or index % 25 == 0:
+            print(f"[graphify frameworks] Preparing source {index}/{total}.", file=sys.stderr, flush=True)
         try:
             with path.open("rb") as stream:
                 raw = stream.read(MAX_SOURCE_BYTES + 1)
@@ -672,9 +915,25 @@ def analyze_paths(paths: list[Path], root: Path) -> EvidenceStore | None:
                 f"Cannot capture exact semantic source: {relative}"
             ) from exc
         document = make_document(source, relative, "tsx" if suffix == ".tsx" else "typescript")
+        pending = [document["tree"]]
+        nodes = 0
+        while pending:
+            node = pending.pop()
+            nodes += 1
+            pending.extend(child["node"] for child in node["children"])
+        if documents and (
+            len(documents) >= MAX_BATCH_DOCUMENTS
+            or source_bytes + len(raw) > MAX_BATCH_SOURCE_BYTES
+            or tree_nodes + nodes > MAX_BATCH_TREE_NODES
+        ):
+            flush_batch()
         documents.append(document)
-        snapshots.append((path, document["sourceHash"]))
-    result = analyze_documents(documents, options=configuration)
+        source_bytes += len(raw)
+        tree_nodes += nodes
+        snapshots.append((path, hashlib.sha256(raw).hexdigest()))
+    flush_batch()
+    print(f"[graphify frameworks] Validating final evidence for {total} files.", file=sys.stderr, flush=True)
+    result = accumulator.finish()
     if options_for_root(base) != configuration:
         raise FrameworkAnalysisError(
             "Framework configuration changed during analysis; retry indexing"
@@ -693,4 +952,8 @@ def analyze_paths(paths: list[Path], root: Path) -> EvidenceStore | None:
             ) from exc
         if hashlib.sha256(current).hexdigest() != expected_hash:
             raise FrameworkAnalysisError("Source changed during framework analysis; retry indexing")
+    print(
+        f"[graphify frameworks] Source evidence ready for {total} files ({monotonic() - started:.1f}s).",
+        file=sys.stderr, flush=True,
+    )
     return result

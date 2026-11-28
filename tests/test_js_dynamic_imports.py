@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 import networkx as nx
+import pytest
 
 from graphify.affected import DEFAULT_AFFECTED_RELATIONS, affected_nodes
 from graphify.extract import _file_node_id, extract
@@ -353,6 +354,25 @@ def test_unresolved_relative_import_is_not_marked_a_module(tmp_path, monkeypatch
             )
 
 
+@pytest.mark.parametrize("directories", [("left", "right"), ("left-dir", "left_dir")])
+def test_missing_relative_imports_in_different_directories_stay_distinct(tmp_path, directories):
+    importers = [
+        _write(tmp_path / directory / "app.ts", "export const later = import('./missing-helper');\n")
+        for directory in directories
+    ]
+
+    result = extract(importers, root=tmp_path, cache_root=tmp_path / ".cache")
+
+    stubs = {node["id"]: node for node in result["nodes"]
+             if node.get("type") == "external" and node.get("label") == "./missing-helper"}
+    assert len(stubs) == 2, "distinct missing local targets must not share an external node"
+    assert all(node.get("external") is True and node.get("source_file") == "" for node in stubs.values())
+    targets = {edge["source_file"]: edge["target"] for edge in result["edges"]
+               if edge["relation"] == "dynamic_import"}
+    assert set(targets) == {f"{directory}/app.ts" for directory in directories}
+    assert set(targets.values()) == set(stubs)
+
+
 def test_scoped_packages_sharing_a_leaf_stay_distinct(tmp_path, monkeypatch):
     """`@a/utils` and `@b/utils` are different packages that share a path leaf.
 
@@ -367,9 +387,10 @@ def test_scoped_packages_sharing_a_leaf_stay_distinct(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = extract([Path("a.mts"), Path("b.mts")], cache_root=tmp_path / ".cache")
 
-    stubs = {n["id"]: n for n in result["nodes"] if n.get("type") == "module"}
+    stubs = {n["id"]: n for n in result["nodes"] if n.get("type") == "external"}
     assert len(stubs) == 2, f"the two packages must not share a node: {sorted(stubs)}"
     assert {n["label"] for n in stubs.values()} == {"@scope-a/utils", "@scope-b/utils"}
+    assert all(n.get("external") is True and n.get("source_file") == "" for n in stubs.values())
 
     node_ids = {n["id"] for n in result["nodes"]}
     targets = {e["target"] for e in result["edges"] if e["relation"] == "dynamic_import"}
@@ -393,9 +414,10 @@ def test_subpath_imports_collapse_onto_their_package(tmp_path, monkeypatch):
     # One stub dict is emitted per importing file; they carry the same id and so
     # collapse to a single node at build. What matters is that the id and the
     # name are the package's, whichever subpath minted them.
-    stubs = [n for n in result["nodes"] if n.get("type") == "module"]
+    stubs = [n for n in result["nodes"] if n.get("type") == "external"]
     assert {n["id"] for n in stubs} == {"lodash"}, "both subpaths are the same package"
     assert {n["label"] for n in stubs} == {"lodash"}, "the node is the package, not one of its subpaths"
+    assert all(n.get("external") is True and n.get("source_file") == "" for n in stubs)
 
     targets = {e["target"] for e in result["edges"] if e["relation"] == "dynamic_import"}
     assert targets == {"lodash"}

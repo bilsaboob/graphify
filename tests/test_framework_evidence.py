@@ -261,6 +261,12 @@ def test_lossless_records_source_manifest_and_defensive_copies():
     entry["result"]["facts"].clear()
     assert len(_store(graph)["documents"]["src/Page.tsx"]["result"]["facts"]) == 66
     assert graph.number_of_nodes() == graph.number_of_edges() == 0
+    response = query_semantics(graph)
+    expected = copy.deepcopy(response)
+    response["matches"][0]["coverage"]["reports"].clear()
+    assert query_semantics(graph) == expected
+    graph.graph[SEMANTIC_EVIDENCE_KEY]["documents"]["src/Page.tsx"]["result"]["facts"][0]["evidence"]["span"]["startByte"] = -1
+    assert query_semantics(graph)["reason"] == "invalid-semantic-evidence"
 
 
 def test_whole_json_graph_round_trip_bypasses_generic_sanitization():
@@ -1027,7 +1033,7 @@ def test_real_installed_worker_aliases_bind_provenance_without_source_rewrites(d
         "export const Panel = component(() => { const [value, setValue] = createSignal(1); "
         "return { value, setValue }; }, " + metadata + ");\r\n"
     )
-    options = normalize_analysis_options({"moduleAliases": aliases}, max_limits=ANNOTATION_LIMITS)
+    options = normalize_analysis_options({"moduleAliases": aliases}, max_limits={**ANNOTATION_LIMITS, "maxPlugins": 8})
     document = make_document(source, "src/Alias.ts", "typescript")
     store = analyze_documents([document], options=options)
     assert validate_store(store) == store

@@ -234,6 +234,17 @@ def _content_token_swap(a: str, b: str) -> bool:
 _FILE_ANCHORED_NONCODE = frozenset({"rationale", "document"})
 
 
+def _is_enriched_document(node: dict) -> bool:
+    """Document meanings and examples have source identity, not label identity."""
+    if Path(str(node.get("source_file") or "")).suffix.lower() not in {".md", ".mdx"}:
+        return False
+    attrs = node.get("attributes")
+    return node.get("node_kind") in {"doc_concept", "doc_mention", "code_example"} or (
+        isinstance(attrs, dict)
+        and any(attrs.get(key) for key in ("summary", "aliases", "code_hints"))
+    )
+
+
 def _crossfile_fileanchored_blocked(node: dict, neighbor: dict) -> bool:
     """Block label-based merging of file-anchored non-code nodes across files (#1284).
 
@@ -243,6 +254,8 @@ def _crossfile_fileanchored_blocked(node: dict, neighbor: dict) -> bool:
     apps.<name>. No business logic here...") that differs by one word and sails
     past the JW threshold. Same-file duplicates of these types may still merge.
     """
+    if _is_enriched_document(node) or _is_enriched_document(neighbor):
+        return node.get("id") != neighbor.get("id")
     if (node.get("file_type") not in _FILE_ANCHORED_NONCODE
             and neighbor.get("file_type") not in _FILE_ANCHORED_NONCODE):
         return False
@@ -1243,7 +1256,7 @@ def deduplicate_entities(
     for node in unique_nodes:
         # Code symbols are keyed by ID, never by label — skip them entirely so
         # distinct same-named symbols are never merged by string similarity (#1205).
-        if _is_code(node):
+        if _is_code(node) or _is_enriched_document(node):
             continue
         key = _norm(node.get("label", node.get("id", "")))
         if key:
@@ -1387,7 +1400,7 @@ def deduplicate_entities(
         # similar long names in different files (parallel backends, sibling
         # classes) must not be fuzzy-merged, and a code↔concept fuzzy match must
         # not transitively union two distinct code symbols via a concept (#1205).
-        if _is_code(node):
+        if _is_code(node) or _is_enriched_document(node):
             continue
         key = _norm(node.get("label", node.get("id", "")))
         if key and key not in seen_norms:

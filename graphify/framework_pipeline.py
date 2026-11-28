@@ -31,10 +31,24 @@ def evidence_from_data(data: dict, *, limits: EvidenceLimits | None = None) -> E
     if "graph" in data and type(metadata) is not dict:
         raise EvidenceValidationError("Evidence graph metadata must be a JSON object")
     top = validate_store(data[KEY], limits=limits) if top_present else None
-    nested = validate_store(data["graph"][KEY], limits=limits) if nested_present else None
+    nested = None
+    if nested_present and isinstance(metadata, dict):
+        nested = top if top_present and data[KEY] is metadata[KEY] else validate_store(metadata[KEY], limits=limits)
     if top_present and nested_present and top != nested:
         raise EvidenceValidationError("Conflicting semantic evidence containers")
     return top if top_present else nested
+
+
+def evidence_is_complete(store: EvidenceStore | None) -> bool:
+    """Coverage predicate for an already validated snapshot, without revalidation."""
+    return all(
+        not entry.get("refreshFailed")
+        and entry["result"]["state"] in {"complete", "not-applicable"}
+        and not entry["result"]["diagnostics"]
+        and all(report["state"] in {"complete", "not-applicable"} and not report["diagnostics"]
+                for report in entry["result"]["reports"])
+        for entry in (store or {}).get("documents", {}).values()
+    )
 
 
 def _source_paths(values: Iterable[str | Path], limits: EvidenceLimits) -> list[str]:
@@ -122,7 +136,7 @@ def combine_evidence(
     for chunk in chunks:
         store = evidence_from_data(chunk, limits=limits)
         if store is not None:
-            incoming = merge_evidence(incoming, store, limits=limits)
+            incoming = store if incoming is None else merge_evidence(incoming, store, limits=limits)
         ownership.append((chunk, set(store["documents"]) if store is not None else set()))
     if prior is None and incoming is None:
         return None
@@ -187,6 +201,8 @@ def combine_evidence(
         )
     replaced.update(fresh)
     deleted = paths(deleted_sources) - replaced - failed
+    if prior is None and not deleted and not failed:
+        return incoming
     return merge_evidence(
         prior,
         incoming,
@@ -197,12 +213,13 @@ def combine_evidence(
     )
 
 
-def pack_raw_evidence(data: dict) -> None:
+def pack_raw_evidence(data: dict) -> EvidenceStore | None:
     """Canonicalize at persistence: graph.semantic_evidence is the sole output slot."""
     store = evidence_from_data(data)
     if store is not None:
         data["graph"] = {**data.get("graph", {}), KEY: store}
         data.pop(KEY, None)
+    return store
 
 
 def prune_evidence(data: dict, sources: Iterable[str], *, root=None) -> None:

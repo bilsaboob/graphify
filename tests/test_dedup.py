@@ -959,15 +959,30 @@ def test_doc_reextract_keeps_ast_node_with_shared_id(tmp_path):
                       "source_file": "pkg.md"}],
            "hyperedges": []}
     G = build_merge([doc], graph_path=tmp_path / "graph.json")
-    assert G.nodes["pkg_test_x"]["source_file"] == "pkg/test_x.py"
-    assert G.has_edge("pkg_overview", "pkg_test_x")
+    assert G.nodes["pkg_test_x"] == {k: v for k, v in _AST_FILE.items() if k != "id"}
+    assert G.has_edge("pkg_test_x", "pkg_test_x_run")
+    assert G.edges["pkg_test_x", "pkg_test_x_run"]["relation"] == "contains"
+    assert G.edges["pkg_test_x", "pkg_test_x_run"]["source_file"] == "pkg/test_x.py"
+    # The documentary occurrence is retained separately, but still leads to
+    # the real file even though its original label ("Tests") does not match.
+    documentary = next(nid for nid, attrs in G.nodes(data=True)
+                       if attrs.get("source_file") == "pkg.md" and attrs.get("label") == "Tests")
+    assert documentary != "pkg_test_x"
+    assert G.has_edge("pkg_overview", documentary)
+    assert G.has_edge(documentary, "pkg_test_x")
+    reference = G.edges[documentary, "pkg_test_x"]
+    assert reference["relation"] == "references" and reference["confidence"] == "AMBIGUOUS"
+    assert reference["source_file"] == "pkg.md" and reference["_origin"] == "semantic"
+    assert "original documentary ID" in reference["match_reason"]
 
     (tmp_path / "graph2.json").write_text(
         json.dumps(json_graph.node_link_data(G, edges="links")))
     doc2 = {"nodes": [dict(overview)], "edges": [], "hyperedges": []}
     G2 = build_merge([doc2], graph_path=tmp_path / "graph2.json")
     assert "pkg_test_x" in G2
-    assert G2.nodes["pkg_test_x"]["source_file"] == "pkg/test_x.py"
+    assert G2.nodes["pkg_test_x"] == {k: v for k, v in _AST_FILE.items() if k != "id"}
+    assert G2.has_edge("pkg_test_x", "pkg_test_x_run")
+    assert documentary not in G2
 
 
 def test_extension_twin_ids_ignore_the_ast_preference():
